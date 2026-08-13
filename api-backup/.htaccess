@@ -1,0 +1,21 @@
+Options -Indexes
+RewriteEngine On
+
+# ── Pass Authorization header through to PHP ───────────────
+# Required on most shared hosts — Apache strips Authorization before PHP sees it.
+# CGIPassAuth tells Apache to forward it even in CGI/FastCGI mode.
+<IfModule mod_rewrite.c>
+    RewriteCond %{HTTP:Authorization} .
+    RewriteRule .* - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]
+    RewriteCond %{ENV:REDIRECT_HTTP_AUTHORIZATION} .
+    RewriteRule .* - [E=HTTP_AUTHORIZATION:%{ENV:REDIRECT_HTTP_AUTHORIZATION}]
+</IfModule>
+
+# CGIPassAuth: explicitly tells Apache not to consume the Authorization header.
+# Requires Apache 2.4.13+. Silently ignored on older versions (still works via above rules).
+<IfModule mod_authz_core.c>
+    CGIPassAuth On
+</IfModule>
+
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteRule ^ index.php [QSA,L]
