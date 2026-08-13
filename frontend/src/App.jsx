@@ -26,9 +26,18 @@ function useAuth() {
     Api.get('auth/me').then(u => { Api.setUser(u); setUser(u); }).catch(() => { Api.clearAuth(); }).finally(() => setLoading(false));
   }, []);
 
-  const login  = async (email, password, tenant) => { const r = await Api.post('auth/login', { email, password, tenant }); Api.setToken(r.token); Api.setUser(r.user); setUser(r.user); return r; };
+  const login = async (email, password, tenant) => {
+    const r = await Api.post('auth/login', { email, password, tenant });
+    if (r.requires_totp) return r; // caller must prompt for a TOTP code and call verifyTotp
+    Api.setToken(r.token); Api.setUser(r.user); setUser(r.user); return r;
+  };
+  const verifyTotp = async (pendingToken, code) => {
+    const r = await Api.post('auth/verify-totp', { pending_token: pendingToken, code });
+    Api.setToken(r.token); Api.setUser(r.user); setUser(r.user); return r;
+  };
   const logout = async () => { try { await Api.post('auth/logout', {}); } catch {} Api.clearAuth(); setUser(null); };
-  return { user, loading, login, logout };
+  const refreshUser = async () => { const u = await Api.get('auth/me'); Api.setUser(u); setUser(u); return u; };
+  return { user, loading, login, verifyTotp, logout, refreshUser };
 }
 
 // ─── Fetch hook ───────────────────────────────────────────
@@ -53,17 +62,55 @@ const fmtN = n => (+n || 0).toLocaleString();
 // ═══════════════════════════════════════════════════════════
 // LOGIN PAGE
 // ═══════════════════════════════════════════════════════════
-function LoginPage({ onLogin }) {
+function LoginPage({ onLogin, onVerifyTotp }) {
   const [f, setF]   = useState({ email: 'admin@metrodist.com', password: '', tenant: 'czium-dist' });
   const [err, setErr] = useState('');
   const [busy, setBusy] = useState(false);
+  const [pendingToken, setPendingToken] = useState(null);
+  const [code, setCode] = useState('');
 
   const submit = async e => {
     e.preventDefault(); setErr(''); setBusy(true);
-    try { await onLogin(f.email, f.password, f.tenant); }
+    try {
+      const r = await onLogin(f.email, f.password, f.tenant);
+      if (r?.requires_totp) setPendingToken(r.pending_token);
+    }
     catch (e) { setErr(e.message || 'Login failed'); }
     finally { setBusy(false); }
   };
+
+  const submitTotp = async e => {
+    e.preventDefault(); setErr(''); setBusy(true);
+    try { await onVerifyTotp(pendingToken, code); }
+    catch (e) { setErr(e.message || 'Invalid code'); }
+    finally { setBusy(false); }
+  };
+
+  if (pendingToken) {
+    return (
+      <div className="min-h-screen bg-background flex items-center justify-center p-4">
+        <div className="w-full max-w-sm">
+          <div className="text-center mb-8">
+            <div className="w-14 h-14 bg-primary rounded-2xl flex items-center justify-center text-2xl mx-auto mb-4 shadow-md">🔒</div>
+            <h1 className="text-2xl font-bold text-foreground">Two-Factor Verification</h1>
+            <p className="text-sm text-muted-foreground mt-1">Enter the 6-digit code from your authenticator app</p>
+          </div>
+          <Card className="shadow-md">
+            <form onSubmit={submitTotp} className="space-y-4">
+              <Input label="Authentication Code" value={code} onChange={e => setCode(e.target.value)} required autoComplete="one-time-code" placeholder="123456" autoFocus />
+              {err && <p className="text-sm text-destructive bg-destructive/10 px-3 py-2 rounded-md">{err}</p>}
+              <Button type="submit" variant="primary" className="w-full" disabled={busy} size="lg">
+                {busy ? <><Spinner size="sm" /> Verifying…</> : 'Verify'}
+              </Button>
+              <button type="button" className="text-xs text-muted-foreground hover:underline w-full text-center" onClick={() => { setPendingToken(null); setCode(''); setErr(''); }}>
+                ← Back to login
+              </button>
+            </form>
+          </Card>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen bg-background flex items-center justify-center p-4">
@@ -641,6 +688,1079 @@ function DistributorsPage() {
 }
 
 // ═══════════════════════════════════════════════════════════
+// CUSTOMERS PAGE
+// ═══════════════════════════════════════════════════════════
+const emptyCustomer = { name: '', type: 'Retail', contact_name: '', email: '', phone: '', address: '', city: '', country: '', territory: '', credit_limit: '', payment_terms: 'Net 30', tax_number: '', status: 'Active', notes: '' };
+
+function CustomerDetail({ id, onClose, onEdit }) {
+  const { data, loading } = useFetch(id ? `customers/${id}` : null);
+  const customer = data?.customer;
+  const orders = data?.recent_orders || [];
+  return (
+    <Modal open={!!id} onClose={onClose} title={customer?.name || 'Customer'} size="lg"
+      footer={<><Button variant="secondary" onClick={onClose}>Close</Button>{customer && <Button onClick={() => onEdit(customer)}>Edit</Button>}</>}>
+      {loading ? <div className="flex justify-center py-16"><Spinner /></div> : customer && (
+        <div className="space-y-5">
+          <div className="flex items-start justify-between">
+            <div>
+              <p className="text-xs text-muted-foreground font-mono">{customer.code}</p>
+              <p className="text-lg font-bold text-foreground">{customer.name}</p>
+              <p className="text-sm text-muted-foreground">{customer.contact_name}</p>
+            </div>
+            <StatusBadge status={customer.status} />
+          </div>
+          <div className="grid grid-cols-2 gap-4 text-sm border-t border-border pt-4">
+            <div><p className="text-xs text-muted-foreground">Email</p><p className="font-medium">{customer.email || '—'}</p></div>
+            <div><p className="text-xs text-muted-foreground">Phone</p><p className="font-medium">{customer.phone || '—'}</p></div>
+            <div><p className="text-xs text-muted-foreground">Type</p><p className="font-medium">{customer.type}</p></div>
+            <div><p className="text-xs text-muted-foreground">Territory</p><p className="font-medium">{customer.territory || '—'}</p></div>
+            <div><p className="text-xs text-muted-foreground">Credit Limit</p><p className="font-medium">{fmt(customer.credit_limit)}</p></div>
+            <div><p className="text-xs text-muted-foreground">Outstanding Balance</p><p className={`font-medium ${+customer.outstanding_balance > 0 ? 'text-destructive' : ''}`}>{fmt(customer.outstanding_balance || 0)}</p></div>
+            <div><p className="text-xs text-muted-foreground">Payment Terms</p><p className="font-medium">{customer.payment_terms}</p></div>
+            <div><p className="text-xs text-muted-foreground">Address</p><p className="font-medium">{[customer.address, customer.city, customer.country].filter(Boolean).join(', ') || '—'}</p></div>
+          </div>
+          <div className="border-t border-border pt-4">
+            <p className="text-sm font-semibold text-foreground mb-2">Recent Orders</p>
+            <Table
+              columns={[
+                { key: 'order_number', header: 'Order #', render: v => <span className="font-mono text-xs font-semibold">{v}</span> },
+                { key: 'order_date', header: 'Date', render: v => new Date(v).toLocaleDateString('en-LK') },
+                { key: 'total_amount', header: 'Total', render: v => fmt(v) },
+                { key: 'status', header: 'Status', render: v => <StatusBadge status={v} /> },
+              ]}
+              data={orders} emptyText="No orders yet"
+            />
+          </div>
+        </div>
+      )}
+    </Modal>
+  );
+}
+
+function CustomersPage() {
+  const [search, setSearch] = useState('');
+  const [status, setStatus] = useState('');
+  const { data, loading, reload } = useFetch('customers', { search, status }, [search, status]);
+  const list = data?.data || [];
+  const [modal, setModal] = useState(null);
+  const [form, setForm] = useState(emptyCustomer);
+  const [busy, setBusy] = useState(false);
+  const [toast, setToast] = useState(null);
+  const [detailId, setDetailId] = useState(null);
+
+  const save = async () => {
+    setBusy(true);
+    try {
+      if (modal?.id) await Api.put(`customers/${modal.id}`, form);
+      else           await Api.post('customers', form);
+      setModal(null); reload();
+      setToast({ message: 'Customer saved', type: 'success' });
+    } catch (e) { setToast({ message: e.message, type: 'danger' }); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <div className="p-6 fade-in">
+      <PageHeader title="Customers" subtitle="Manage customer accounts and credit"
+        actions={<Button onClick={() => { setForm(emptyCustomer); setModal({}); }}>+ Add Customer</Button>} />
+      <Card padding={false}>
+        <div className="p-4 border-b border-border flex flex-wrap gap-3">
+          <SearchInput value={search} onChange={setSearch} placeholder="Search name, code, email…" className="w-64" />
+          <Select value={status} onChange={e => setStatus(e.target.value)} className="w-36">
+            <option value="">All Status</option>
+            <option>Active</option><option>Inactive</option><option>On Hold</option>
+          </Select>
+        </div>
+        <Table
+          loading={loading}
+          onRowClick={row => setDetailId(row.id)}
+          columns={[
+            { key: 'code', header: 'Code', render: v => <span className="font-mono text-xs">{v}</span> },
+            { key: 'name', header: 'Name' },
+            { key: 'contact_name', header: 'Contact' },
+            { key: 'territory', header: 'Territory', render: v => v || '—' },
+            { key: 'credit_limit', header: 'Credit Limit', render: v => fmt(v) },
+            { key: 'outstanding_balance', header: 'Outstanding', render: v => <span className={+v > 0 ? 'text-destructive font-medium' : ''}>{fmt(v || 0)}</span> },
+            { key: 'status', header: 'Status', render: v => <StatusBadge status={v} /> },
+            { key: 'id', header: '', render: (v, row) => (
+              <Button variant="ghost" size="xs" onClick={e => { e.stopPropagation(); setForm(row); setModal(row); }}>Edit</Button>
+            )},
+          ]}
+          data={list} emptyText="No customers found"
+        />
+      </Card>
+
+      <Modal open={!!modal} onClose={() => setModal(null)} title={modal?.id ? 'Edit Customer' : 'Add Customer'} size="lg"
+        footer={<><Button variant="secondary" onClick={() => setModal(null)}>Cancel</Button><Button onClick={save} disabled={busy}>{busy ? <Spinner size="sm" /> : 'Save'}</Button></>}>
+        <div className="grid grid-cols-2 gap-4">
+          <Input label="Business Name *" value={form.name || ''} onChange={e => setForm(p => ({ ...p, name: e.target.value }))} required className="col-span-2" />
+          <Select label="Type" value={form.type || 'Retail'} onChange={e => setForm(p => ({ ...p, type: e.target.value }))}>
+            <option>Retail</option><option>Wholesale</option><option>Distributor</option>
+          </Select>
+          <Select label="Status" value={form.status || 'Active'} onChange={e => setForm(p => ({ ...p, status: e.target.value }))}>
+            <option>Active</option><option>Inactive</option><option>On Hold</option>
+          </Select>
+          <Input label="Contact Person *" value={form.contact_name || ''} onChange={e => setForm(p => ({ ...p, contact_name: e.target.value }))} required />
+          <Input label="Phone" value={form.phone || ''} onChange={e => setForm(p => ({ ...p, phone: e.target.value }))} />
+          <Input label="Email" type="email" value={form.email || ''} onChange={e => setForm(p => ({ ...p, email: e.target.value }))} className="col-span-2" />
+          <Input label="Address" value={form.address || ''} onChange={e => setForm(p => ({ ...p, address: e.target.value }))} className="col-span-2" />
+          <Input label="City" value={form.city || ''} onChange={e => setForm(p => ({ ...p, city: e.target.value }))} />
+          <Input label="Country" value={form.country || ''} onChange={e => setForm(p => ({ ...p, country: e.target.value }))} />
+          <Input label="Territory" value={form.territory || ''} onChange={e => setForm(p => ({ ...p, territory: e.target.value }))} />
+          <Input label="Tax Number" value={form.tax_number || ''} onChange={e => setForm(p => ({ ...p, tax_number: e.target.value }))} />
+          <Input label="Credit Limit (Rs.)" type="number" value={form.credit_limit || ''} onChange={e => setForm(p => ({ ...p, credit_limit: e.target.value }))} />
+          <Select label="Payment Terms" value={form.payment_terms || 'Net 30'} onChange={e => setForm(p => ({ ...p, payment_terms: e.target.value }))}>
+            <option>Net 15</option><option>Net 30</option><option>Net 60</option><option>Cash</option>
+          </Select>
+          <Textarea label="Notes" value={form.notes || ''} onChange={e => setForm(p => ({ ...p, notes: e.target.value }))} className="col-span-2" />
+        </div>
+      </Modal>
+
+      <CustomerDetail id={detailId} onClose={() => setDetailId(null)} onEdit={c => { setForm(c); setModal(c); setDetailId(null); }} />
+      {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════
+// PRODUCTS PAGE
+// ═══════════════════════════════════════════════════════════
+const emptyProduct = { name: '', sku: '', barcode: '', brand: '', unit_of_measure: 'Piece', cost_price: '', sale_price: '', reorder_point: '', reorder_qty: '', costing_method: 'FIFO', status: 'Active', description: '' };
+
+function ProductDetail({ id, onClose, onEdit }) {
+  const { data, loading } = useFetch(id ? `products/${id}` : null);
+  const product = data?.product;
+  const stock = data?.stock || [];
+  const moves = data?.movements || [];
+  return (
+    <Modal open={!!id} onClose={onClose} title={product?.name || 'Product'} size="lg"
+      footer={<><Button variant="secondary" onClick={onClose}>Close</Button>{product && <Button onClick={() => onEdit(product)}>Edit</Button>}</>}>
+      {loading ? <div className="flex justify-center py-16"><Spinner /></div> : product && (
+        <div className="space-y-5">
+          <div className="flex items-start justify-between">
+            <div>
+              <p className="text-xs text-muted-foreground font-mono">{product.sku}</p>
+              <p className="text-lg font-bold text-foreground">{product.name}</p>
+              <p className="text-sm text-muted-foreground">{product.brand}</p>
+            </div>
+            <StatusBadge status={product.status} />
+          </div>
+          <div className="grid grid-cols-2 gap-4 text-sm border-t border-border pt-4">
+            <div><p className="text-xs text-muted-foreground">Cost Price</p><p className="font-medium">{fmt(product.cost_price)}</p></div>
+            <div><p className="text-xs text-muted-foreground">Sale Price</p><p className="font-medium">{fmt(product.sale_price)}</p></div>
+            <div><p className="text-xs text-muted-foreground">Unit</p><p className="font-medium">{product.unit_of_measure}</p></div>
+            <div><p className="text-xs text-muted-foreground">Reorder Point</p><p className="font-medium">{fmtN(product.reorder_point)}</p></div>
+          </div>
+          <div className="border-t border-border pt-4">
+            <p className="text-sm font-semibold text-foreground mb-2">Stock by Warehouse</p>
+            <Table
+              columns={[
+                { key: 'warehouse_name', header: 'Warehouse' },
+                { key: 'qty_on_hand', header: 'On Hand', render: v => fmtN(v) },
+                { key: 'qty_reserved', header: 'Reserved', render: v => fmtN(v) },
+                { key: 'qty_available', header: 'Available', render: v => <span className="font-semibold">{fmtN(v)}</span> },
+              ]}
+              data={stock} emptyText="No stock recorded"
+            />
+          </div>
+          <div className="border-t border-border pt-4">
+            <p className="text-sm font-semibold text-foreground mb-2">Recent Movements</p>
+            <Table
+              columns={[
+                { key: 'created_at', header: 'Date', render: v => new Date(v).toLocaleDateString('en-LK') },
+                { key: 'type', header: 'Type', render: v => <Badge variant={v === 'IN' ? 'success' : v === 'OUT' ? 'danger' : 'default'}>{v}</Badge> },
+                { key: 'qty', header: 'Qty', render: v => fmtN(v) },
+                { key: 'reason', header: 'Reason' },
+              ]}
+              data={moves} emptyText="No movements yet"
+            />
+          </div>
+        </div>
+      )}
+    </Modal>
+  );
+}
+
+function ProductsPage() {
+  const [search, setSearch] = useState('');
+  const [status, setStatus] = useState('');
+  const { data, loading, reload } = useFetch('products', { search, status }, [search, status]);
+  const list = data?.data || [];
+  const [modal, setModal] = useState(null);
+  const [form, setForm] = useState(emptyProduct);
+  const [busy, setBusy] = useState(false);
+  const [toast, setToast] = useState(null);
+  const [detailId, setDetailId] = useState(null);
+
+  const save = async () => {
+    setBusy(true);
+    try {
+      if (modal?.id) await Api.put(`products/${modal.id}`, form);
+      else           await Api.post('products', form);
+      setModal(null); reload();
+      setToast({ message: 'Product saved', type: 'success' });
+    } catch (e) { setToast({ message: e.message, type: 'danger' }); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <div className="p-6 fade-in">
+      <PageHeader title="Products" subtitle="Manage your product catalog"
+        actions={<Button onClick={() => { setForm(emptyProduct); setModal({}); }}>+ Add Product</Button>} />
+      <Card padding={false}>
+        <div className="p-4 border-b border-border flex flex-wrap gap-3">
+          <SearchInput value={search} onChange={setSearch} placeholder="Search name, SKU, brand…" className="w-64" />
+          <Select value={status} onChange={e => setStatus(e.target.value)} className="w-40">
+            <option value="">All Status</option>
+            <option>Active</option><option>Inactive</option><option>Discontinued</option>
+          </Select>
+        </div>
+        <Table
+          loading={loading}
+          onRowClick={row => setDetailId(row.id)}
+          columns={[
+            { key: 'sku', header: 'SKU', render: v => <span className="font-mono text-xs">{v}</span> },
+            { key: 'name', header: 'Name' },
+            { key: 'brand', header: 'Brand', render: v => v || '—' },
+            { key: 'sale_price', header: 'Sale Price', render: v => fmt(v) },
+            { key: 'total_stock', header: 'Stock', render: (v, row) => <span className={+v <= +row.reorder_point ? 'text-destructive font-semibold' : 'font-semibold'}>{fmtN(v || 0)}</span> },
+            { key: 'status', header: 'Status', render: v => <StatusBadge status={v} /> },
+            { key: 'id', header: '', render: (v, row) => (
+              <Button variant="ghost" size="xs" onClick={e => { e.stopPropagation(); setForm(row); setModal(row); }}>Edit</Button>
+            )},
+          ]}
+          data={list} emptyText="No products found"
+        />
+      </Card>
+
+      <Modal open={!!modal} onClose={() => setModal(null)} title={modal?.id ? 'Edit Product' : 'Add Product'} size="lg"
+        footer={<><Button variant="secondary" onClick={() => setModal(null)}>Cancel</Button><Button onClick={save} disabled={busy}>{busy ? <Spinner size="sm" /> : 'Save'}</Button></>}>
+        <div className="grid grid-cols-2 gap-4">
+          <Input label="Product Name *" value={form.name || ''} onChange={e => setForm(p => ({ ...p, name: e.target.value }))} required className="col-span-2" />
+          <Input label="SKU *" value={form.sku || ''} onChange={e => setForm(p => ({ ...p, sku: e.target.value }))} required />
+          <Input label="Barcode" value={form.barcode || ''} onChange={e => setForm(p => ({ ...p, barcode: e.target.value }))} />
+          <Input label="Brand" value={form.brand || ''} onChange={e => setForm(p => ({ ...p, brand: e.target.value }))} />
+          <Select label="Unit of Measure" value={form.unit_of_measure || 'Piece'} onChange={e => setForm(p => ({ ...p, unit_of_measure: e.target.value }))}>
+            <option>Piece</option><option>Kg</option><option>Gram</option><option>Litre</option><option>Box</option><option>Packet</option>
+          </Select>
+          <Input label="Cost Price *" type="number" step="0.01" value={form.cost_price || ''} onChange={e => setForm(p => ({ ...p, cost_price: e.target.value }))} required />
+          <Input label="Sale Price *" type="number" step="0.01" value={form.sale_price || ''} onChange={e => setForm(p => ({ ...p, sale_price: e.target.value }))} required />
+          <Input label="Reorder Point" type="number" value={form.reorder_point || ''} onChange={e => setForm(p => ({ ...p, reorder_point: e.target.value }))} />
+          <Input label="Reorder Qty" type="number" value={form.reorder_qty || ''} onChange={e => setForm(p => ({ ...p, reorder_qty: e.target.value }))} />
+          <Select label="Costing Method" value={form.costing_method || 'FIFO'} onChange={e => setForm(p => ({ ...p, costing_method: e.target.value }))}>
+            <option>FIFO</option><option>LIFO</option><option>Average</option>
+          </Select>
+          <Select label="Status" value={form.status || 'Active'} onChange={e => setForm(p => ({ ...p, status: e.target.value }))}>
+            <option>Active</option><option>Inactive</option><option>Discontinued</option>
+          </Select>
+          <Textarea label="Description" value={form.description || ''} onChange={e => setForm(p => ({ ...p, description: e.target.value }))} className="col-span-2" />
+        </div>
+      </Modal>
+
+      <ProductDetail id={detailId} onClose={() => setDetailId(null)} onEdit={p => { setForm(p); setModal(p); setDetailId(null); }} />
+      {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════
+// INVENTORY PAGE
+// ═══════════════════════════════════════════════════════════
+function InventoryPage() {
+  const [search, setSearch] = useState('');
+  const [alert, setAlert] = useState('');
+  const { data, loading, reload } = useFetch('inventory', { search, alert }, [search, alert]);
+  const { data: warehouses } = useFetch('warehouses');
+  const { data: products } = useFetch('products');
+  const list = data?.data || [];
+  const whList = Array.isArray(warehouses) ? warehouses : [];
+  const prodList = products?.data || [];
+  const [modal, setModal] = useState(false);
+  const [form, setForm] = useState({ product_id: '', warehouse_id: '', qty: '', type: 'ADJUSTMENT', reason: '', notes: '' });
+  const [busy, setBusy] = useState(false);
+  const [toast, setToast] = useState(null);
+
+  const save = async () => {
+    setBusy(true);
+    try {
+      await Api.post('inventory', form);
+      setModal(false); reload();
+      setToast({ message: 'Stock movement recorded', type: 'success' });
+    } catch (e) { setToast({ message: e.message, type: 'danger' }); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <div className="p-6 fade-in">
+      <PageHeader title="Inventory" subtitle="Stock levels across all warehouses"
+        actions={<Button onClick={() => { setForm({ product_id: '', warehouse_id: '', qty: '', type: 'ADJUSTMENT', reason: '', notes: '' }); setModal(true); }}>+ Adjust Stock</Button>} />
+      <Card padding={false}>
+        <div className="p-4 border-b border-border flex flex-wrap gap-3">
+          <SearchInput value={search} onChange={setSearch} placeholder="Search name, SKU…" className="w-64" />
+          <Select value={alert} onChange={e => setAlert(e.target.value)} className="w-40">
+            <option value="">All Stock</option>
+            <option value="low">Low Stock</option>
+            <option value="zero">Out of Stock</option>
+          </Select>
+        </div>
+        <Table
+          loading={loading}
+          columns={[
+            { key: 'sku', header: 'SKU', render: v => <span className="font-mono text-xs">{v}</span> },
+            { key: 'name', header: 'Product' },
+            { key: 'warehouse_name', header: 'Warehouse', render: v => v || '—' },
+            { key: 'qty_on_hand', header: 'On Hand', render: v => fmtN(v || 0) },
+            { key: 'qty_reserved', header: 'Reserved', render: v => fmtN(v || 0) },
+            { key: 'qty_available', header: 'Available', render: (v, row) => <span className={+(v ?? row.qty_on_hand) <= +row.reorder_point ? 'text-destructive font-semibold' : 'font-semibold'}>{fmtN(v ?? row.qty_on_hand ?? 0)}</span> },
+            { key: 'reorder_point', header: 'Reorder At', render: v => fmtN(v || 0) },
+          ]}
+          data={list} emptyText="No inventory records found"
+        />
+      </Card>
+
+      <Modal open={modal} onClose={() => setModal(false)} title="Adjust Stock"
+        footer={<><Button variant="secondary" onClick={() => setModal(false)}>Cancel</Button><Button onClick={save} disabled={busy}>{busy ? <Spinner size="sm" /> : 'Record Movement'}</Button></>}>
+        <div className="space-y-4">
+          <Select label="Product *" value={form.product_id} onChange={e => setForm(p => ({ ...p, product_id: e.target.value }))} required>
+            <option value="">Select product…</option>
+            {prodList.map(p => <option key={p.id} value={p.id}>{p.name} ({p.sku})</option>)}
+          </Select>
+          <Select label="Warehouse *" value={form.warehouse_id} onChange={e => setForm(p => ({ ...p, warehouse_id: e.target.value }))} required>
+            <option value="">Select warehouse…</option>
+            {whList.map(w => <option key={w.id} value={w.id}>{w.name}</option>)}
+          </Select>
+          <Select label="Movement Type *" value={form.type} onChange={e => setForm(p => ({ ...p, type: e.target.value }))} required>
+            <option value="IN">IN — Stock In</option>
+            <option value="OUT">OUT — Stock Out</option>
+            <option value="ADJUSTMENT">ADJUSTMENT — Correction</option>
+            <option value="DAMAGED">DAMAGED</option>
+            <option value="RETURN">RETURN</option>
+            <option value="COUNT">COUNT — Physical Count</option>
+          </Select>
+          <Input label="Quantity *" type="number" value={form.qty} onChange={e => setForm(p => ({ ...p, qty: e.target.value }))} required />
+          {form.type === 'ADJUSTMENT' && <p className="text-xs text-muted-foreground -mt-2">Use a negative number to reduce stock.</p>}
+          <Input label="Reason *" value={form.reason} onChange={e => setForm(p => ({ ...p, reason: e.target.value }))} placeholder="e.g. Physical count correction" required />
+          <Textarea label="Notes" value={form.notes} onChange={e => setForm(p => ({ ...p, notes: e.target.value }))} />
+        </div>
+      </Modal>
+      {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════
+// SUPPLIERS PAGE
+// ═══════════════════════════════════════════════════════════
+const emptySupplier = { name: '', contact_name: '', email: '', phone: '', address: '', city: '', country: '', payment_terms: 'Net 30', tax_number: '', status: 'Active', notes: '' };
+
+function SuppliersPage() {
+  const [search, setSearch] = useState('');
+  const { data, loading, reload } = useFetch('suppliers', { search }, [search]);
+  const list = data?.data || [];
+  const [modal, setModal] = useState(null);
+  const [form, setForm] = useState(emptySupplier);
+  const [busy, setBusy] = useState(false);
+  const [toast, setToast] = useState(null);
+
+  const save = async () => {
+    setBusy(true);
+    try {
+      if (modal?.id) await Api.put(`suppliers/${modal.id}`, form);
+      else           await Api.post('suppliers', form);
+      setModal(null); reload();
+      setToast({ message: 'Supplier saved', type: 'success' });
+    } catch (e) { setToast({ message: e.message, type: 'danger' }); }
+    finally { setBusy(false); }
+  };
+
+  const remove = async (row) => {
+    if (!confirm(`Delete supplier "${row.name}"?`)) return;
+    try { await Api.delete(`suppliers/${row.id}`); reload(); setToast({ message: 'Supplier deleted', type: 'success' }); }
+    catch (e) { setToast({ message: e.message, type: 'danger' }); }
+  };
+
+  return (
+    <div className="p-6 fade-in">
+      <PageHeader title="Suppliers" subtitle="Manage your supplier accounts"
+        actions={<Button onClick={() => { setForm(emptySupplier); setModal({}); }}>+ Add Supplier</Button>} />
+      <Card padding={false}>
+        <div className="p-4 border-b border-border">
+          <SearchInput value={search} onChange={setSearch} placeholder="Search name, code…" className="w-64" />
+        </div>
+        <Table
+          loading={loading}
+          columns={[
+            { key: 'code', header: 'Code', render: v => <span className="font-mono text-xs">{v}</span> },
+            { key: 'name', header: 'Name' },
+            { key: 'contact_name', header: 'Contact' },
+            { key: 'phone', header: 'Phone', render: v => v || '—' },
+            { key: 'payment_terms', header: 'Terms' },
+            { key: 'status', header: 'Status', render: v => <StatusBadge status={v} /> },
+            { key: 'id', header: '', render: (v, row) => (
+              <div className="flex gap-1">
+                <Button variant="ghost" size="xs" onClick={e => { e.stopPropagation(); setForm(row); setModal(row); }}>Edit</Button>
+                <Button variant="ghost" size="xs" onClick={e => { e.stopPropagation(); remove(row); }} className="text-destructive">Delete</Button>
+              </div>
+            )},
+          ]}
+          data={list} emptyText="No suppliers found"
+        />
+      </Card>
+
+      <Modal open={!!modal} onClose={() => setModal(null)} title={modal?.id ? 'Edit Supplier' : 'Add Supplier'} size="lg"
+        footer={<><Button variant="secondary" onClick={() => setModal(null)}>Cancel</Button><Button onClick={save} disabled={busy}>{busy ? <Spinner size="sm" /> : 'Save'}</Button></>}>
+        <div className="grid grid-cols-2 gap-4">
+          <Input label="Business Name *" value={form.name || ''} onChange={e => setForm(p => ({ ...p, name: e.target.value }))} required className="col-span-2" />
+          <Input label="Contact Person *" value={form.contact_name || ''} onChange={e => setForm(p => ({ ...p, contact_name: e.target.value }))} required />
+          <Input label="Phone" value={form.phone || ''} onChange={e => setForm(p => ({ ...p, phone: e.target.value }))} />
+          <Input label="Email" type="email" value={form.email || ''} onChange={e => setForm(p => ({ ...p, email: e.target.value }))} className="col-span-2" />
+          <Input label="Address" value={form.address || ''} onChange={e => setForm(p => ({ ...p, address: e.target.value }))} className="col-span-2" />
+          <Input label="City" value={form.city || ''} onChange={e => setForm(p => ({ ...p, city: e.target.value }))} />
+          <Input label="Country" value={form.country || ''} onChange={e => setForm(p => ({ ...p, country: e.target.value }))} />
+          <Select label="Payment Terms" value={form.payment_terms || 'Net 30'} onChange={e => setForm(p => ({ ...p, payment_terms: e.target.value }))}>
+            <option>Net 15</option><option>Net 30</option><option>Net 60</option><option>Cash</option>
+          </Select>
+          <Input label="Tax Number" value={form.tax_number || ''} onChange={e => setForm(p => ({ ...p, tax_number: e.target.value }))} />
+          <Select label="Status" value={form.status || 'Active'} onChange={e => setForm(p => ({ ...p, status: e.target.value }))}>
+            <option>Active</option><option>Inactive</option>
+          </Select>
+          <Textarea label="Notes" value={form.notes || ''} onChange={e => setForm(p => ({ ...p, notes: e.target.value }))} className="col-span-2" />
+        </div>
+      </Modal>
+      {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════
+// PURCHASING (PURCHASE ORDERS) PAGE
+// ═══════════════════════════════════════════════════════════
+function PurchaseOrderDetail({ id, onClose, onReceive }) {
+  const { data, loading, reload } = useFetch(id ? `purchase-orders/${id}` : null);
+  const po = data?.po;
+  const items = data?.items || [];
+  const [receiveModal, setReceiveModal] = useState(false);
+  const [receiveQtys, setReceiveQtys] = useState({});
+  const [busy, setBusy] = useState(false);
+  const [toast, setToast] = useState(null);
+
+  const openReceive = () => {
+    const q = {};
+    items.forEach(it => { q[it.product_id] = Math.max(0, (+it.qty_ordered) - (+it.qty_received)); });
+    setReceiveQtys(q); setReceiveModal(true);
+  };
+
+  const submitReceive = async () => {
+    setBusy(true);
+    try {
+      const receiveItems = Object.entries(receiveQtys).filter(([, v]) => +v > 0).map(([product_id, qty_received]) => ({ product_id, qty_received: +qty_received }));
+      if (!receiveItems.length) throw new Error('Enter at least one quantity to receive.');
+      await Api.post(`purchase-orders/${id}/receive`, { items: receiveItems });
+      setReceiveModal(false); reload(); onReceive?.();
+      setToast({ message: 'Goods received', type: 'success' });
+    } catch (e) { setToast({ message: e.message, type: 'danger' }); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <>
+      <Modal open={!!id} onClose={onClose} title={po?.po_number || 'Purchase Order'} size="lg"
+        footer={<>
+          <Button variant="secondary" onClick={onClose}>Close</Button>
+          {po && !['Received', 'Cancelled', 'Draft'].includes(po.status) && <Button onClick={openReceive}>Receive Goods</Button>}
+        </>}>
+        {loading ? <div className="flex justify-center py-16"><Spinner /></div> : po && (
+          <div className="space-y-5">
+            <div className="flex items-start justify-between">
+              <div>
+                <p className="text-lg font-bold text-foreground">{po.po_number}</p>
+                <p className="text-sm text-muted-foreground">{po.supplier_name}</p>
+              </div>
+              <StatusBadge status={po.status} />
+            </div>
+            <div className="grid grid-cols-3 gap-4 text-sm border-t border-border pt-4">
+              <div><p className="text-xs text-muted-foreground">Order Date</p><p className="font-medium">{new Date(po.order_date).toLocaleDateString('en-LK')}</p></div>
+              <div><p className="text-xs text-muted-foreground">Expected</p><p className="font-medium">{po.expected_date ? new Date(po.expected_date).toLocaleDateString('en-LK') : '—'}</p></div>
+              <div><p className="text-xs text-muted-foreground">Total</p><p className="font-semibold">{fmt(po.total_amount)}</p></div>
+            </div>
+            <div className="border-t border-border pt-4">
+              <p className="text-sm font-semibold text-foreground mb-2">Items</p>
+              <Table
+                columns={[
+                  { key: 'sku', header: 'SKU', render: v => <span className="font-mono text-xs">{v}</span> },
+                  { key: 'product_name', header: 'Product' },
+                  { key: 'qty_ordered', header: 'Ordered', render: v => fmtN(v) },
+                  { key: 'qty_received', header: 'Received', render: v => fmtN(v) },
+                  { key: 'unit_cost', header: 'Unit Cost', render: v => fmt(v) },
+                  { key: 'line_total', header: 'Line Total', render: v => fmt(v) },
+                ]}
+                data={items} emptyText="No items"
+              />
+            </div>
+          </div>
+        )}
+      </Modal>
+      <Modal open={receiveModal} onClose={() => setReceiveModal(false)} title="Receive Goods"
+        footer={<><Button variant="secondary" onClick={() => setReceiveModal(false)}>Cancel</Button><Button onClick={submitReceive} disabled={busy}>{busy ? <Spinner size="sm" /> : 'Confirm Receipt'}</Button></>}>
+        <div className="space-y-3">
+          {items.map(it => (
+            <div key={it.product_id} className="flex items-center gap-3">
+              <div className="flex-1">
+                <p className="text-sm font-medium">{it.product_name}</p>
+                <p className="text-xs text-muted-foreground">Ordered {fmtN(it.qty_ordered)} · Received {fmtN(it.qty_received)}</p>
+              </div>
+              <Input type="number" value={receiveQtys[it.product_id] ?? 0}
+                onChange={e => setReceiveQtys(p => ({ ...p, [it.product_id]: e.target.value }))}
+                className="w-28" min="0" max={+it.qty_ordered - +it.qty_received} />
+            </div>
+          ))}
+        </div>
+      </Modal>
+      {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
+    </>
+  );
+}
+
+function PurchasingPage() {
+  const [search, setSearch] = useState('');
+  const [status, setStatus] = useState('');
+  const { data, loading, reload } = useFetch('purchase-orders', { search, status }, [search, status]);
+  const list = data?.data || [];
+  const { data: suppliers } = useFetch('suppliers');
+  const { data: products } = useFetch('products');
+  const { data: warehouses } = useFetch('warehouses');
+  const suppList = suppliers?.data || [];
+  const prodList = products?.data || [];
+  const whList = Array.isArray(warehouses) ? warehouses : [];
+
+  const [modal, setModal] = useState(false);
+  const [form, setForm] = useState({ supplier_id: '', warehouse_id: '', order_date: new Date().toISOString().slice(0, 10), expected_date: '', notes: '' });
+  const [lineItems, setLineItems] = useState([{ product_id: '', qty_ordered: 1, unit_cost: '' }]);
+  const [busy, setBusy] = useState(false);
+  const [toast, setToast] = useState(null);
+  const [detailId, setDetailId] = useState(null);
+
+  const addLine = () => setLineItems(p => [...p, { product_id: '', qty_ordered: 1, unit_cost: '' }]);
+  const removeLine = (i) => setLineItems(p => p.filter((_, idx) => idx !== i));
+  const updateLine = (i, field, val) => setLineItems(p => p.map((l, idx) => idx === i ? { ...l, [field]: val } : l));
+
+  const save = async () => {
+    setBusy(true);
+    try {
+      const items = lineItems.filter(l => l.product_id).map(l => ({ product_id: l.product_id, qty_ordered: +l.qty_ordered, unit_cost: l.unit_cost ? +l.unit_cost : undefined }));
+      if (!items.length) throw new Error('Add at least one item.');
+      await Api.post('purchase-orders', { ...form, items });
+      setModal(false); reload();
+      setForm({ supplier_id: '', warehouse_id: '', order_date: new Date().toISOString().slice(0, 10), expected_date: '', notes: '' });
+      setLineItems([{ product_id: '', qty_ordered: 1, unit_cost: '' }]);
+      setToast({ message: 'Purchase order created', type: 'success' });
+    } catch (e) { setToast({ message: e.message, type: 'danger' }); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <div className="p-6 fade-in">
+      <PageHeader title="Purchasing" subtitle="Purchase orders and goods receipts"
+        actions={<Button onClick={() => setModal(true)}>+ New Purchase Order</Button>} />
+      <Card padding={false}>
+        <div className="p-4 border-b border-border flex flex-wrap gap-3">
+          <SearchInput value={search} onChange={setSearch} placeholder="Search PO #, supplier…" className="w-64" />
+          <Select value={status} onChange={e => setStatus(e.target.value)} className="w-40">
+            <option value="">All Status</option>
+            <option>Draft</option><option>Confirmed</option><option>Sent</option><option>Partially Received</option><option>Received</option><option>Cancelled</option>
+          </Select>
+        </div>
+        <Table
+          loading={loading}
+          onRowClick={row => setDetailId(row.id)}
+          columns={[
+            { key: 'po_number', header: 'PO #', render: v => <span className="font-mono text-xs font-semibold">{v}</span> },
+            { key: 'supplier_name', header: 'Supplier' },
+            { key: 'order_date', header: 'Date', render: v => new Date(v).toLocaleDateString('en-LK') },
+            { key: 'total_amount', header: 'Total', render: v => fmt(v) },
+            { key: 'status', header: 'Status', render: v => <StatusBadge status={v} /> },
+          ]}
+          data={list} emptyText="No purchase orders found"
+        />
+      </Card>
+
+      <Modal open={modal} onClose={() => setModal(false)} title="New Purchase Order" size="xl"
+        footer={<><Button variant="secondary" onClick={() => setModal(false)}>Cancel</Button><Button onClick={save} disabled={busy}>{busy ? <Spinner size="sm" /> : 'Create PO'}</Button></>}>
+        <div className="space-y-4">
+          <div className="grid grid-cols-2 gap-4">
+            <Select label="Supplier *" value={form.supplier_id} onChange={e => setForm(p => ({ ...p, supplier_id: e.target.value }))} required>
+              <option value="">Select supplier…</option>
+              {suppList.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+            </Select>
+            <Select label="Warehouse" value={form.warehouse_id} onChange={e => setForm(p => ({ ...p, warehouse_id: e.target.value }))}>
+              <option value="">Select warehouse…</option>
+              {whList.map(w => <option key={w.id} value={w.id}>{w.name}</option>)}
+            </Select>
+            <Input label="Order Date *" type="date" value={form.order_date} onChange={e => setForm(p => ({ ...p, order_date: e.target.value }))} required />
+            <Input label="Expected Date" type="date" value={form.expected_date} onChange={e => setForm(p => ({ ...p, expected_date: e.target.value }))} />
+          </div>
+          <div>
+            <div className="flex items-center justify-between mb-2">
+              <p className="text-sm font-semibold text-foreground">Line Items</p>
+              <Button variant="outline" size="xs" onClick={addLine}>+ Add Line</Button>
+            </div>
+            <div className="space-y-2">
+              {lineItems.map((line, i) => (
+                <div key={i} className="flex items-center gap-2">
+                  <Select value={line.product_id} onChange={e => updateLine(i, 'product_id', e.target.value)} className="flex-1">
+                    <option value="">Select product…</option>
+                    {prodList.map(p => <option key={p.id} value={p.id}>{p.name} ({p.sku})</option>)}
+                  </Select>
+                  <Input type="number" value={line.qty_ordered} onChange={e => updateLine(i, 'qty_ordered', e.target.value)} className="w-24" placeholder="Qty" />
+                  <Input type="number" step="0.01" value={line.unit_cost} onChange={e => updateLine(i, 'unit_cost', e.target.value)} className="w-28" placeholder="Unit cost" />
+                  {lineItems.length > 1 && <Button variant="ghost" size="xs" onClick={() => removeLine(i)} className="text-destructive">✕</Button>}
+                </div>
+              ))}
+            </div>
+          </div>
+          <Textarea label="Notes" value={form.notes} onChange={e => setForm(p => ({ ...p, notes: e.target.value }))} />
+        </div>
+      </Modal>
+
+      <PurchaseOrderDetail id={detailId} onClose={() => setDetailId(null)} onReceive={reload} />
+      {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════
+// INVOICES PAGE
+// ═══════════════════════════════════════════════════════════
+function InvoiceDetail({ id, onClose, onPaid }) {
+  const { data: invoice, loading, reload } = useFetch(id ? `invoices/${id}` : null);
+  const [payModal, setPayModal] = useState(false);
+  const [payForm, setPayForm] = useState({ amount: '', payment_date: new Date().toISOString().slice(0, 10), method: 'Cash', reference: '' });
+  const [busy, setBusy] = useState(false);
+  const [toast, setToast] = useState(null);
+
+  const balance = invoice ? (+invoice.total_amount - +(invoice.paid_amount || 0)) : 0;
+
+  const openPay = () => { setPayForm({ amount: balance > 0 ? balance.toFixed(2) : '', payment_date: new Date().toISOString().slice(0, 10), method: 'Cash', reference: '' }); setPayModal(true); };
+
+  const recordPayment = async () => {
+    setBusy(true);
+    try {
+      await Api.post('payments', { ...payForm, invoice_id: id, customer_id: invoice.customer_id });
+      setPayModal(false); reload(); onPaid?.();
+      setToast({ message: 'Payment recorded', type: 'success' });
+    } catch (e) { setToast({ message: e.message, type: 'danger' }); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <>
+      <Modal open={!!id} onClose={onClose} title={invoice?.invoice_number || 'Invoice'} size="lg"
+        footer={<><Button variant="secondary" onClick={onClose}>Close</Button>{invoice && balance > 0 && <Button onClick={openPay}>Record Payment</Button>}</>}>
+        {loading ? <div className="flex justify-center py-16"><Spinner /></div> : invoice && (
+          <div className="space-y-5">
+            <div className="flex items-start justify-between">
+              <div>
+                <p className="text-lg font-bold text-foreground">{invoice.invoice_number}</p>
+                <p className="text-sm text-muted-foreground">{invoice.customer_name}</p>
+              </div>
+              <StatusBadge status={invoice.status} />
+            </div>
+            <div className="grid grid-cols-2 gap-4 text-sm border-t border-border pt-4">
+              <div><p className="text-xs text-muted-foreground">Invoice Date</p><p className="font-medium">{new Date(invoice.invoice_date).toLocaleDateString('en-LK')}</p></div>
+              <div><p className="text-xs text-muted-foreground">Due Date</p><p className="font-medium">{invoice.due_date ? new Date(invoice.due_date).toLocaleDateString('en-LK') : '—'}</p></div>
+              <div><p className="text-xs text-muted-foreground">Total</p><p className="font-semibold">{fmt(invoice.total_amount)}</p></div>
+              <div><p className="text-xs text-muted-foreground">Paid</p><p className="font-semibold text-success">{fmt(invoice.paid_amount || 0)}</p></div>
+              <div className="col-span-2"><p className="text-xs text-muted-foreground">Balance Due</p><p className={`text-lg font-bold ${balance > 0 ? 'text-destructive' : 'text-success'}`}>{fmt(balance)}</p></div>
+            </div>
+            {invoice.notes && <div className="border-t border-border pt-4"><p className="text-xs text-muted-foreground mb-1">Notes</p><p className="text-sm">{invoice.notes}</p></div>}
+          </div>
+        )}
+      </Modal>
+      <Modal open={payModal} onClose={() => setPayModal(false)} title="Record Payment"
+        footer={<><Button variant="secondary" onClick={() => setPayModal(false)}>Cancel</Button><Button onClick={recordPayment} disabled={busy}>{busy ? <Spinner size="sm" /> : 'Save Payment'}</Button></>}>
+        <div className="space-y-4">
+          <Input label="Amount *" type="number" step="0.01" value={payForm.amount} onChange={e => setPayForm(p => ({ ...p, amount: e.target.value }))} required />
+          <Input label="Payment Date *" type="date" value={payForm.payment_date} onChange={e => setPayForm(p => ({ ...p, payment_date: e.target.value }))} required />
+          <Select label="Method *" value={payForm.method} onChange={e => setPayForm(p => ({ ...p, method: e.target.value }))} required>
+            <option>Cash</option><option>Bank Transfer</option><option>Cheque</option><option>Card</option><option>Online</option>
+          </Select>
+          <Input label="Reference" value={payForm.reference} onChange={e => setPayForm(p => ({ ...p, reference: e.target.value }))} placeholder="Cheque #, transaction ID, etc." />
+        </div>
+      </Modal>
+      {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
+    </>
+  );
+}
+
+function InvoicesPage() {
+  const [status, setStatus] = useState('');
+  const { data, loading, reload } = useFetch('invoices', status ? { status } : undefined, [status]);
+  const list = data?.data || [];
+  const [detailId, setDetailId] = useState(null);
+
+  return (
+    <div className="p-6 fade-in">
+      <PageHeader title="Invoices" subtitle="Track billing and payments" />
+      <Card padding={false}>
+        <div className="p-4 border-b border-border flex flex-wrap gap-3">
+          <Select value={status} onChange={e => setStatus(e.target.value)} className="w-44">
+            <option value="">All Status</option>
+            <option>Draft</option><option>Sent</option><option>Partially Paid</option><option>Paid</option><option>Overdue</option><option>Cancelled</option>
+          </Select>
+        </div>
+        <Table
+          loading={loading}
+          onRowClick={row => setDetailId(row.id)}
+          columns={[
+            { key: 'invoice_number', header: 'Invoice #', render: v => <span className="font-mono text-xs font-semibold">{v}</span> },
+            { key: 'customer_name', header: 'Customer' },
+            { key: 'invoice_date', header: 'Date', render: v => new Date(v).toLocaleDateString('en-LK') },
+            { key: 'due_date', header: 'Due', render: v => v ? new Date(v).toLocaleDateString('en-LK') : '—' },
+            { key: 'total_amount', header: 'Total', render: v => fmt(v) },
+            { key: 'paid_amount', header: 'Paid', render: v => fmt(v || 0) },
+            { key: 'status', header: 'Status', render: v => <StatusBadge status={v} /> },
+          ]}
+          data={list} emptyText="No invoices found"
+        />
+      </Card>
+      <InvoiceDetail id={detailId} onClose={() => setDetailId(null)} onPaid={reload} />
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════
+// REPORTS PAGE
+// ═══════════════════════════════════════════════════════════
+function ReportsPage() {
+  const [range, setRange] = useState({ from: new Date(new Date().setDate(1)).toISOString().slice(0, 10), to: new Date().toISOString().slice(0, 10) });
+  const { data, loading } = useFetch('reports', range, [range.from, range.to]);
+  const salesSummary = data?.salesSummary || [];
+  const topCustomers = data?.topCustomers || [];
+  const topProducts = data?.topProducts || [];
+  const monthlyTrend = data?.monthlyTrend || [];
+  const ar = data?.arAgeing || {};
+
+  const exportData = async (type) => {
+    try {
+      const r = await Api.get('export', { type, format: 'csv' });
+      if (!r.rows) { alert('No data to export'); return; }
+      const headers = r.headers || [];
+      const csv = [headers.join(','), ...r.data.map(row => headers.map(h => JSON.stringify(row[h] ?? '')).join(','))].join('\n');
+      const blob = new Blob([csv], { type: 'text/csv' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a'); a.href = url; a.download = `${type}.csv`; a.click();
+      URL.revokeObjectURL(url);
+    } catch (e) { alert(e.message); }
+  };
+
+  const totalOrders = salesSummary.reduce((s, r) => s + (+r.count || 0), 0);
+  const totalRevenue = salesSummary.reduce((s, r) => s + (+r.total || 0), 0);
+  const totalCollected = salesSummary.reduce((s, r) => s + (+r.paid || 0), 0);
+  const totalAr = (+ar.current_30 || 0) + (+ar.days_31_60 || 0) + (+ar.days_61_90 || 0) + (+ar.over_90 || 0);
+
+  return (
+    <div className="p-6 fade-in">
+      <PageHeader title="Reports" subtitle="Sales performance and receivables"
+        actions={
+          <div className="flex gap-2">
+            <Input type="date" value={range.from} onChange={e => setRange(p => ({ ...p, from: e.target.value }))} className="w-40" />
+            <Input type="date" value={range.to} onChange={e => setRange(p => ({ ...p, to: e.target.value }))} className="w-40" />
+          </div>
+        } />
+
+      {loading ? <div className="flex justify-center py-32"><Spinner size="lg" /></div> : (
+        <div className="space-y-6">
+          <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
+            <KpiCard label="Total Orders" value={fmtN(totalOrders)} icon="🛒" color="primary" />
+            <KpiCard label="Revenue" value={fmt(totalRevenue)} icon="💰" color="success" />
+            <KpiCard label="Collected" value={fmt(totalCollected)} icon="💳" color="cyan" />
+            <KpiCard label="Outstanding AR" value={fmt(totalAr)} icon="📄" color="warning" />
+          </div>
+
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            <Card>
+              <CardHeader><CardTitle>Monthly Revenue Trend</CardTitle></CardHeader>
+              <BarChart data={monthlyTrend} labelKey="label" valueKey="revenue" format={v => `Rs. ${(+v / 1000).toFixed(1)}k`} />
+            </Card>
+            <Card>
+              <CardHeader><CardTitle>Orders by Status</CardTitle></CardHeader>
+              <BarChart data={salesSummary} labelKey="status" valueKey="count" />
+            </Card>
+          </div>
+
+          <Card>
+            <CardHeader>
+              <CardTitle>Accounts Receivable Ageing</CardTitle>
+            </CardHeader>
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+              <div className="text-center p-3 rounded-lg bg-muted/50">
+                <p className="text-xs text-muted-foreground mb-1">Current (0-30d)</p>
+                <p className="text-lg font-bold text-foreground">{fmt(ar.current_30 || 0)}</p>
+              </div>
+              <div className="text-center p-3 rounded-lg bg-warning/10">
+                <p className="text-xs text-muted-foreground mb-1">31-60 days</p>
+                <p className="text-lg font-bold text-warning">{fmt(ar.days_31_60 || 0)}</p>
+              </div>
+              <div className="text-center p-3 rounded-lg bg-warning/10">
+                <p className="text-xs text-muted-foreground mb-1">61-90 days</p>
+                <p className="text-lg font-bold text-warning">{fmt(ar.days_61_90 || 0)}</p>
+              </div>
+              <div className="text-center p-3 rounded-lg bg-destructive/10">
+                <p className="text-xs text-muted-foreground mb-1">Over 90 days</p>
+                <p className="text-lg font-bold text-destructive">{fmt(ar.over_90 || 0)}</p>
+              </div>
+            </div>
+          </Card>
+
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            <Card padding={false}>
+              <div className="p-4 border-b border-border"><CardTitle>Top Customers</CardTitle></div>
+              <Table
+                columns={[
+                  { key: 'name', header: 'Customer' },
+                  { key: 'order_count', header: 'Orders', render: v => fmtN(v) },
+                  { key: 'revenue', header: 'Revenue', render: v => fmt(v) },
+                ]}
+                data={topCustomers} emptyText="No data for this period"
+              />
+            </Card>
+            <Card padding={false}>
+              <div className="p-4 border-b border-border"><CardTitle>Top Products</CardTitle></div>
+              <Table
+                columns={[
+                  { key: 'sku', header: 'SKU', render: v => <span className="font-mono text-xs">{v}</span> },
+                  { key: 'name', header: 'Product' },
+                  { key: 'qty_sold', header: 'Qty Sold', render: v => fmtN(v) },
+                  { key: 'revenue', header: 'Revenue', render: v => fmt(v) },
+                ]}
+                data={topProducts} emptyText="No data for this period"
+              />
+            </Card>
+          </div>
+
+          <Card>
+            <CardHeader><CardTitle>Export Data</CardTitle></CardHeader>
+            <div className="flex flex-wrap gap-2">
+              <Button variant="outline" size="sm" onClick={() => exportData('orders')}>⬇ Orders CSV</Button>
+              <Button variant="outline" size="sm" onClick={() => exportData('customers')}>⬇ Customers CSV</Button>
+              <Button variant="outline" size="sm" onClick={() => exportData('products')}>⬇ Products CSV</Button>
+              <Button variant="outline" size="sm" onClick={() => exportData('inventory')}>⬇ Inventory CSV</Button>
+            </div>
+          </Card>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════
+// SETTINGS PAGE — Users, Roles, Security (2FA)
+// ═══════════════════════════════════════════════════════════
+function SettingsUsersTab() {
+  const { data, loading, reload } = useFetch('users');
+  const { data: roles } = useFetch('roles');
+  const list = Array.isArray(data) ? data : [];
+  const roleList = Array.isArray(roles) ? roles : [];
+  const [modal, setModal] = useState(null);
+  const [form, setForm] = useState({ name: '', email: '', password: '', phone: '', role_id: '' });
+  const [busy, setBusy] = useState(false);
+  const [toast, setToast] = useState(null);
+
+  const save = async () => {
+    setBusy(true);
+    try {
+      if (modal?.id) { const { password, email, ...rest } = form; await Api.put(`users/${modal.id}`, password ? { ...rest, password } : rest); }
+      else            await Api.post('users', form);
+      setModal(null); reload();
+      setToast({ message: 'User saved', type: 'success' });
+    } catch (e) { setToast({ message: e.message, type: 'danger' }); }
+    finally { setBusy(false); }
+  };
+
+  const remove = async (row) => {
+    if (!confirm(`Deactivate user "${row.name}"?`)) return;
+    try { await Api.delete(`users/${row.id}`); reload(); setToast({ message: 'User removed', type: 'success' }); }
+    catch (e) { setToast({ message: e.message, type: 'danger' }); }
+  };
+
+  return (
+    <div>
+      <div className="flex justify-end mb-3">
+        <Button size="sm" onClick={() => { setForm({ name: '', email: '', password: '', phone: '', role_id: roleList[0]?.id || '' }); setModal({}); }}>+ Add User</Button>
+      </div>
+      <Card padding={false}>
+        <Table
+          loading={loading}
+          columns={[
+            { key: 'name', header: 'Name' },
+            { key: 'email', header: 'Email' },
+            { key: 'phone', header: 'Phone', render: v => v || '—' },
+            { key: 'role_name', header: 'Role', render: v => <Badge>{v}</Badge> },
+            { key: 'is_active', header: 'Status', render: v => <StatusBadge status={v ? 'Active' : 'Inactive'} /> },
+            { key: 'last_login_at', header: 'Last Login', render: v => v ? new Date(v).toLocaleDateString('en-LK') : 'Never' },
+            { key: 'id', header: '', render: (v, row) => (
+              <div className="flex gap-1">
+                <Button variant="ghost" size="xs" onClick={() => { setForm({ ...row, password: '' }); setModal(row); }}>Edit</Button>
+                <Button variant="ghost" size="xs" onClick={() => remove(row)} className="text-destructive">Remove</Button>
+              </div>
+            )},
+          ]}
+          data={list} emptyText="No users found"
+        />
+      </Card>
+
+      <Modal open={!!modal} onClose={() => setModal(null)} title={modal?.id ? 'Edit User' : 'Add User'}
+        footer={<><Button variant="secondary" onClick={() => setModal(null)}>Cancel</Button><Button onClick={save} disabled={busy}>{busy ? <Spinner size="sm" /> : 'Save'}</Button></>}>
+        <div className="space-y-4">
+          <Input label="Full Name *" value={form.name || ''} onChange={e => setForm(p => ({ ...p, name: e.target.value }))} required />
+          <Input label="Email *" type="email" value={form.email || ''} onChange={e => setForm(p => ({ ...p, email: e.target.value }))} required disabled={!!modal?.id} />
+          <Input label="Phone" value={form.phone || ''} onChange={e => setForm(p => ({ ...p, phone: e.target.value }))} />
+          <Select label="Role *" value={form.role_id || ''} onChange={e => setForm(p => ({ ...p, role_id: e.target.value }))} required>
+            <option value="">Select role…</option>
+            {roleList.map(r => <option key={r.id} value={r.id}>{r.name}</option>)}
+          </Select>
+          <Input label={modal?.id ? 'New Password (leave blank to keep current)' : 'Password *'} type="password" value={form.password || ''} onChange={e => setForm(p => ({ ...p, password: e.target.value }))} required={!modal?.id} placeholder="8+ chars, upper, lower, number" />
+        </div>
+      </Modal>
+      {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
+    </div>
+  );
+}
+
+function SettingsRolesTab() {
+  const { data, loading } = useFetch('roles');
+  const list = Array.isArray(data) ? data : [];
+  return (
+    <Card padding={false}>
+      <Table
+        loading={loading}
+        columns={[
+          { key: 'name', header: 'Role' },
+          { key: 'is_system', header: 'Type', render: v => <Badge variant={v ? 'default' : 'muted'}>{v ? 'System' : 'Custom'}</Badge> },
+          { key: 'permissions', header: 'Permissions', render: v => {
+            const p = typeof v === 'string' ? JSON.parse(v || '{}') : (v || {});
+            if (p.all) return <Badge variant="success">Full Access</Badge>;
+            const mods = Object.keys(p).length;
+            return <span className="text-xs text-muted-foreground">{mods} module{mods !== 1 ? 's' : ''} configured</span>;
+          }},
+        ]}
+        data={list} emptyText="No roles found"
+      />
+    </Card>
+  );
+}
+
+function SettingsSecurityTab({ user, onUserChange }) {
+  const [step, setStep] = useState('idle'); // idle | setup | enabled
+  const [secret, setSecret] = useState('');
+  const [qrUri, setQrUri] = useState('');
+  const [code, setCode] = useState('');
+  const [recoveryCodes, setRecoveryCodes] = useState(null);
+  const [disablePw, setDisablePw] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [toast, setToast] = useState(null);
+  const totpEnabled = !!user?.totp_enabled;
+
+  const startSetup = async () => {
+    setBusy(true);
+    try {
+      const r = await Api.post('two-factor/setup', {});
+      setSecret(r.secret); setQrUri(r.qr_uri); setStep('setup');
+    } catch (e) { setToast({ message: e.message, type: 'danger' }); }
+    finally { setBusy(false); }
+  };
+
+  const confirmEnable = async () => {
+    setBusy(true);
+    try {
+      const r = await Api.post('two-factor/enable', { code });
+      setRecoveryCodes(r.recovery_codes); setStep('enabled');
+      await onUserChange?.();
+      setToast({ message: '2FA enabled', type: 'success' });
+    } catch (e) { setToast({ message: e.message, type: 'danger' }); }
+    finally { setBusy(false); }
+  };
+
+  const disable = async () => {
+    setBusy(true);
+    try {
+      await Api.post('two-factor/disable', { current_password: disablePw });
+      setStep('idle'); setDisablePw('');
+      await onUserChange?.();
+      setToast({ message: '2FA disabled', type: 'success' });
+    } catch (e) { setToast({ message: e.message, type: 'danger' }); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <Card className="max-w-xl">
+      <CardHeader><CardTitle>Two-Factor Authentication</CardTitle></CardHeader>
+      {totpEnabled && step !== 'enabled' ? (
+        <div className="space-y-4">
+          <div className="flex items-center gap-2 text-sm text-success"><Badge variant="success">Enabled</Badge> Your account is protected with 2FA.</div>
+          <div className="border-t border-border pt-4">
+            <p className="text-sm font-medium text-foreground mb-2">Disable 2FA</p>
+            <div className="flex gap-2">
+              <Input type="password" placeholder="Current password" value={disablePw} onChange={e => setDisablePw(e.target.value)} className="flex-1" />
+              <Button variant="danger" onClick={disable} disabled={busy || !disablePw}>{busy ? <Spinner size="sm" /> : 'Disable'}</Button>
+            </div>
+          </div>
+        </div>
+      ) : step === 'idle' ? (
+        <div className="space-y-3">
+          <p className="text-sm text-muted-foreground">Add an extra layer of security — a 6-digit code from an authenticator app will be required at login.</p>
+          <Button onClick={startSetup} disabled={busy}>{busy ? <Spinner size="sm" /> : 'Set Up 2FA'}</Button>
+        </div>
+      ) : step === 'setup' ? (
+        <div className="space-y-4">
+          <p className="text-sm text-muted-foreground">Scan this with your authenticator app (Google Authenticator, Authy, 1Password), or enter the key manually:</p>
+          <div className="bg-muted rounded-md p-3 font-mono text-sm break-all">{secret}</div>
+          <div className="bg-muted rounded-md p-3 text-xs break-all text-muted-foreground">{qrUri}</div>
+          <Input label="Enter the 6-digit code to confirm" value={code} onChange={e => setCode(e.target.value)} placeholder="123456" autoFocus />
+          <div className="flex gap-2">
+            <Button variant="secondary" onClick={() => setStep('idle')}>Cancel</Button>
+            <Button onClick={confirmEnable} disabled={busy || !code}>{busy ? <Spinner size="sm" /> : 'Confirm & Enable'}</Button>
+          </div>
+        </div>
+      ) : (
+        <div className="space-y-4">
+          <div className="flex items-center gap-2 text-sm text-success"><Badge variant="success">Enabled</Badge> 2FA is now active.</div>
+          {recoveryCodes && (
+            <div className="border border-warning/40 bg-warning/10 rounded-md p-3">
+              <p className="text-xs font-semibold text-warning mb-2">Save these recovery codes — shown only once:</p>
+              <div className="grid grid-cols-2 gap-1 font-mono text-xs">
+                {recoveryCodes.map(c => <span key={c}>{c}</span>)}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+      {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
+    </Card>
+  );
+}
+
+function SettingsPage({ user, onUserChange }) {
+  const [tab, setTab] = useState('users');
+  return (
+    <div className="p-6 fade-in">
+      <PageHeader title="Settings" subtitle="Users, roles and security" />
+      <Tabs
+        tabs={[
+          { key: 'users', label: 'Users', icon: '👥' },
+          { key: 'roles', label: 'Roles', icon: '🔑' },
+          { key: 'security', label: 'Security', icon: '🔒' },
+        ]}
+        active={tab} onChange={setTab} className="mb-4 w-fit"
+      />
+      {tab === 'users'    && <SettingsUsersTab />}
+      {tab === 'roles'    && <SettingsRolesTab />}
+      {tab === 'security' && <SettingsSecurityTab user={user} onUserChange={onUserChange} />}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════
 // GENERIC LIST PAGE (Orders, Customers, Products, etc.)
 // ═══════════════════════════════════════════════════════════
 function GenericPage({ title, icon, endpoint, columns, addLabel, renderForm, emptyIcon, subtitle }) {
@@ -724,25 +1844,11 @@ function OrdersPage() {
 }
 
 // ═══════════════════════════════════════════════════════════
-// PLACEHOLDER for existing pages (Customers, Products, etc.)
-// ═══════════════════════════════════════════════════════════
-function ComingSoon({ title, icon }) {
-  return (
-    <div className="p-6 fade-in">
-      <PageHeader title={`${icon} ${title}`} />
-      <Card className="flex items-center justify-center py-24">
-        <EmptyState icon={icon} title={title} description="This module is available — loading data from existing API endpoints." />
-      </Card>
-    </div>
-  );
-}
-
-// ═══════════════════════════════════════════════════════════
 // MAIN APP
 // ═══════════════════════════════════════════════════════════
 export default function App() {
   const [dark, toggleTheme] = useTheme();
-  const { user, loading, login, logout } = useAuth();
+  const { user, loading, login, verifyTotp, logout, refreshUser } = useAuth();
   const [page, setPage]     = useState('dashboard');
   const [sidebarCollapsed, setSidebarCollapsed] = useState(window.innerWidth < 1024);
 
@@ -762,7 +1868,7 @@ export default function App() {
     </div>
   );
 
-  if (!user) return <LoginPage onLogin={login} />;
+  if (!user) return <LoginPage onLogin={login} onVerifyTotp={verifyTotp} />;
 
   const renderPage = () => {
     switch (page) {
@@ -772,14 +1878,14 @@ export default function App() {
       case 'areas':        return <AreasPage />;
       case 'production':   return <ProductionPage />;
       case 'distributors': return <DistributorsPage />;
-      case 'customers':    return <ComingSoon title="Customers"  icon="🏪" />;
-      case 'products':     return <ComingSoon title="Products"   icon="📦" />;
-      case 'inventory':    return <ComingSoon title="Inventory"  icon="🏗️" />;
-      case 'suppliers':    return <ComingSoon title="Suppliers"  icon="🏭" />;
-      case 'purchasing':   return <ComingSoon title="Purchasing" icon="🧾" />;
-      case 'invoices':     return <ComingSoon title="Invoices"   icon="💳" />;
-      case 'reports':      return <ComingSoon title="Reports"    icon="📈" />;
-      case 'settings':     return <ComingSoon title="Settings"   icon="⚙️" />;
+      case 'customers':    return <CustomersPage />;
+      case 'products':     return <ProductsPage />;
+      case 'inventory':    return <InventoryPage />;
+      case 'suppliers':    return <SuppliersPage />;
+      case 'purchasing':   return <PurchasingPage />;
+      case 'invoices':     return <InvoicesPage />;
+      case 'reports':      return <ReportsPage />;
+      case 'settings':     return <SettingsPage user={user} onUserChange={refreshUser} />;
       default:             return <DashboardPage />;
     }
   };

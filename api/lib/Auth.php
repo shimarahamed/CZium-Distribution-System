@@ -4,7 +4,7 @@ class Auth {
     private static ?array $me = null;
 
     public static function login(string $email, string $pw, string $slug): array {
-        RateLimiter::hit('login:'.self::ip(), 10, 60);
+        RateLimiter::hit('login:'.self::ip(), 10, 60, failClosed: true);
         $t = Db::one("SELECT * FROM tenants WHERE slug=? AND is_active=1 LIMIT 1", [$slug]);
         if (!$t) throw new AuthErr('Organisation not found or inactive.');
         Db::setTenant($t['id']);
@@ -65,10 +65,10 @@ class Auth {
 
     // ─── Forgot password: create reset token, email link ──
     public static function requestReset(string $email, string $slug): void {
-        RateLimiter::hit('reset:'.self::ip(), 5, 300);
+        RateLimiter::hit('reset:'.self::ip(), 5, 300, failClosed: true);
         // Security Audit em4: also limit per target email, independent of IP —
         // otherwise an attacker can rotate IPs to flood one victim's inbox.
-        RateLimiter::hit('reset-email:'.strtolower(trim($email)), 3, 900);
+        RateLimiter::hit('reset-email:'.strtolower(trim($email)), 3, 900, failClosed: true);
         $t = Db::one("SELECT * FROM tenants WHERE slug=? AND is_active=1 LIMIT 1", [$slug]);
         if (!$t) return; // do not reveal
         Db::setTenant($t['id']);
@@ -198,6 +198,7 @@ class Auth {
             'is_rep'               => !empty($u['rep_id']) && empty($perms['all']),
             'tenant'               => ['id'=>$t['id'],'name'=>$t['name'],'slug'=>$t['slug']],
             'must_change_password' => (bool)$u['must_change_password'],
+            'totp_enabled'         => !empty($u['totp_enabled']),
         ];
     }
     public static function mkJwt(array $pl): string {

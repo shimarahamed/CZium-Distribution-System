@@ -2,8 +2,16 @@
 // ═══ Audit ═══
 class Audit {
     public static function log(string $act, string $type, ?string $eid=null, ?string $label=null, ?array $old=null, ?array $new=null): void {
+        $u = Auth::me(); $tid = Auth::tid();
+        if (!$tid) {
+            // No resolved tenant (e.g. a failed login before tenant lookup) — the
+            // audit_logs.tenant_id column is a real tenant FK, so writing a sentinel
+            // like 'SYSTEM' there would either violate the FK or corrupt tenant-scoped
+            // audit queries. Log to the error log instead of losing the row silently.
+            error_log(sprintf('[Audit] (no tenant) %s %s#%s by %s', $act, $type, $eid ?? '-', $u['name'] ?? 'System'));
+            return;
+        }
         try {
-            $u = Auth::me(); $tid = Auth::tid() ?: 'SYSTEM';
             Db::run("INSERT INTO audit_logs(tenant_id,user_id,user_name,action,entity_type,entity_id,entity_label,old_values,new_values,ip_address,user_agent) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 [$tid,$u['id']??null,$u['name']??'System',$act,$type,$eid,$label,
                  $old?json_encode($old):null,$new?json_encode($new):null,
@@ -90,7 +98,15 @@ class Csrf {
 
 // ═══ Rate Limiter — DB-backed (multi-server safe) ═══
 class RateLimiter {
-    public static function hit(string $key, int $max, int $window): void {
+    /**
+     * @param bool $failClosed When true, a limiter error (DB down/table missing)
+     *   blocks the request with 503 instead of silently letting it through.
+     *   Reserved for auth-sensitive endpoints (login, password reset) where an
+     *   attacker could otherwise use DB degradation as a brute-force window;
+     *   left false (fail-open) everywhere else so a DB hiccup doesn't take down
+     *   the whole app over a non-critical limiter.
+     */
+    public static function hit(string $key, int $max, int $window, bool $failClosed = false): void {
         try {
             $now = time();
             $bucket = (int) floor($now / $window);
@@ -102,8 +118,8 @@ class RateLimiter {
             // opportunistic cleanup (1% of requests)
             if (mt_rand(1,100) === 1) Db::run("DELETE FROM rate_limits WHERE expires_at < NOW()");
         } catch (Throwable $e) {
-            // If rate-limit table missing or DB busy, fail open (don't block legit traffic)
             error_log('[RateLimit] '.$e->getMessage());
+            if ($failClosed) Http::fail('Service temporarily unavailable. Please try again shortly.', 503);
         }
     }
 }
@@ -148,10 +164,31 @@ class Webhook {
         } catch (Throwable $e) { error_log('[Webhook] dispatch error: '.$e->getMessage()); }
     }
 
+    /**
+     * Reject webhook URLs that resolve to loopback, link-local, or private
+     * ranges (RFC1918/RFC4193) so a tenant-configured webhook can't be used
+     * to probe internal infrastructure or cloud metadata endpoints (SSRF).
+     */
+    public static function isUrlSafe(string $url): bool {
+        $parts = parse_url($url);
+        if (!$parts || !in_array($parts['scheme'] ?? '', ['http','https'], true) || empty($parts['host'])) return false;
+        $host = $parts['host'];
+        $ip = filter_var($host, FILTER_VALIDATE_IP) ? $host : gethostbyname($host);
+        if (!filter_var($ip, FILTER_VALIDATE_IP)) return false;
+        // Blocks loopback, private, link-local (incl. 169.254.169.254 cloud metadata) ranges.
+        return (bool) filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE);
+    }
+
     private static function deliver(array $sub, string $event, array $data): void {
         $payload = json_encode(['event' => $event, 'data' => $data, 'timestamp' => time()]);
         $sig = hash_hmac('sha256', $payload, $sub['secret']);
         $ok = false; $code = 0;
+        if (!self::isUrlSafe($sub['url'])) {
+            error_log('[Webhook] blocked unsafe URL: '.$sub['url']);
+            Db::run("INSERT INTO webhook_deliveries(id,tenant_id,subscription_id,event,payload,status_code,success,attempts) VALUES(?,?,?,?,?,?,0,1)",
+                [Db::uuid(), $sub['tenant_id'], $sub['id'], $event, $payload, null]);
+            return;
+        }
         try {
             $ctx = stream_context_create([
                 'http' => [

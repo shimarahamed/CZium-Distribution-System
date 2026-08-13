@@ -472,6 +472,9 @@ function route_webhooks(string $m, $id, array $b, array $q, $tid, $uid): never {
         if (!filter_var($b['url'], FILTER_VALIDATE_URL) || !str_starts_with($b['url'], 'https://')) {
             throw new Unproc('Webhook URL must be a valid https:// URL.', ['url' => ['Must be https://']]);
         }
+        if (!Webhook::isUrlSafe($b['url'])) {
+            throw new Unproc('Webhook URL must not point to a private, loopback, or link-local address.', ['url' => ['Not allowed']]);
+        }
         $events = $b['events'] ?? ['*'];
         $id2 = Db::uuid();
         $secret = Webhook::newSecret();

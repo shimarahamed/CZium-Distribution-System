@@ -276,7 +276,7 @@ function route_customers(string $m, $id, $sub, array $b, array $q, $tid, $uid, $
             if ($st){$w.=" AND status=?";$p[]=$st;}
             // Row-level scoping: a rep only sees shops inside their assigned areas.
             [$scSql,$scP] = Scope::customers('customers');
-            if ($scSql) { $w .= str_replace('customers.','',$scSql); $p = array_merge($p, $scP); }
+            if ($scSql) { $w .= $scSql; $p = array_merge($p, $scP); }
             [$rows,$pg]=Db::paged("SELECT * FROM customers $w ORDER BY name",$p,(int)($q['page']??1));
             Http::paged($rows,$pg);
         case 'POST':
@@ -404,7 +404,7 @@ function route_inventory(string $m, $id, array $b, array $q, $tid, $uid): never 
             $inv=Db::one("SELECT * FROM inventory WHERE product_id=? AND warehouse_id=? AND tenant_id=?",[$b['product_id'],$b['warehouse_id'],$t]);
             $before=(float)($inv['qty_on_hand']??0);
             $after=Calc::applyMovement($before,(float)$b['qty'],$b['type']);
-            if (in_array($b['type'],['OUT','DAMAGED'])&&$after<=0&&($before-(float)$b['qty'])<0) throw new Unproc("Insufficient stock. Available: $before");
+            if (in_array($b['type'],['OUT','DAMAGED'])&&($before-abs((float)$b['qty']))<0) throw new Unproc("Insufficient stock. Available: $before");
             Db::run("INSERT INTO inventory(id,tenant_id,product_id,warehouse_id,qty_on_hand,avg_cost) VALUES(?,?,?,?,?,?) ON DUPLICATE KEY UPDATE qty_on_hand=?",[Db::uuid(),$t,$b['product_id'],$b['warehouse_id'],$after,$prod['cost_price'],$after]);
             Db::run("INSERT INTO stock_movements(tenant_id,product_id,warehouse_id,type,batch_number,lot_number,expiry_date,qty,unit_cost,qty_before,qty_after,reason,notes,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 [$t,$b['product_id'],$b['warehouse_id'],$b['type'],$b['batch_number']??null,$b['lot_number']??null,$b['expiry_date']??null,abs((float)$b['qty']),$prod['cost_price'],$before,$after,$b['reason'],$b['notes']??null,$uid()]);
@@ -544,13 +544,30 @@ function route_orders(string $m, $id, $sub, array $b, array $q, $tid, $uid, $fin
             Auth::need('orders','update');
             $o=Db::one("SELECT * FROM sales_orders WHERE id=? AND tenant_id=? AND deleted_at IS NULL",[$id,$t]);
             if (!$o) throw new NotFound('Order not found');
+            $newStatus = $b['status'] ?? $o['status'];
             if (!empty($b['status'])&&$b['status']!==$o['status']) {
                 if (!Calc::canTransition($o['status'],$b['status']))
                     throw new Unproc("Cannot change '{$o['status']}' → '{$b['status']}'. Allowed: ".implode(', ',Calc::allowedTransitions($o['status'])));
             }
             $dat=($b['status']??'')==='Delivered'&&!$o['delivered_at']?date('Y-m-d H:i:s'):$o['delivered_at'];
-            Db::run("UPDATE sales_orders SET status=?,payment_status=?,priority=?,delivery_date=?,notes=?,delivered_at=?,updated_by=? WHERE id=? AND tenant_id=?",
-                [$b['status']??$o['status'],$b['payment_status']??$o['payment_status'],$b['priority']??$o['priority'],$b['delivery_date']??$o['delivery_date'],$b['notes']??$o['notes'],$dat,$uid(),$id,$t]);
+            Db::begin();
+            try {
+                Db::run("UPDATE sales_orders SET status=?,payment_status=?,priority=?,delivery_date=?,notes=?,delivered_at=?,updated_by=? WHERE id=? AND tenant_id=?",
+                    [$newStatus,$b['payment_status']??$o['payment_status'],$b['priority']??$o['priority'],$b['delivery_date']??$o['delivery_date'],$b['notes']??$o['notes'],$dat,$uid(),$id,$t]);
+                // Inventory reservation lifecycle: qty_reserved is incremented once at order
+                // creation (if a warehouse was set) and must be released exactly once, at
+                // whichever of these two terminal transitions happens first — otherwise the
+                // stock stays locked forever (Cancelled) or is double-counted as both on-hand
+                // and reserved (Shipped, where goods actually leave the warehouse).
+                if ($o['warehouse_id'] && $newStatus!==$o['status']) {
+                    if ($newStatus==='Cancelled') {
+                        dos_release_order_reservation($t,$o['warehouse_id'],$id);
+                    } elseif ($newStatus==='Shipped') {
+                        dos_ship_order_inventory($t,$uid(),$o['warehouse_id'],$id);
+                    }
+                }
+                Db::commit();
+            } catch (Throwable $e) { Db::rollback(); throw $e; }
             Audit::log('UPDATE','sales_order',$id,$o['order_number'],$o,Audit::diff($o,$b));
             Http::ok(Db::one("SELECT * FROM sales_orders WHERE id=? AND tenant_id=?",[$id,$t]));
         case 'DELETE':
@@ -561,6 +578,39 @@ function route_orders(string $m, $id, $sub, array $b, array $q, $tid, $uid, $fin
             Audit::log('DELETE','sales_order',$id,$o['order_number'],$o);
             Http::noContent();
         default: throw new Err('Method not allowed',405);
+    }
+}
+
+/**
+ * Release the qty_reserved placed on a cancelled order's line items back to
+ * available stock. Idempotent per-call within a transaction; must be paired
+ * with the caller checking $order['warehouse_id'] was actually set (no
+ * warehouse => no reservation was ever made at creation time).
+ */
+function dos_release_order_reservation(string $tid, string $warehouseId, string $orderId): void {
+    $items = Db::all("SELECT product_id,qty_ordered FROM sales_order_items WHERE order_id=? AND tenant_id=?", [$orderId, $tid]);
+    foreach ($items as $it) {
+        Db::run("UPDATE inventory SET qty_reserved=GREATEST(0,qty_reserved-?) WHERE product_id=? AND warehouse_id=? AND tenant_id=?",
+            [$it['qty_ordered'], $it['product_id'], $warehouseId, $tid]);
+    }
+}
+
+/**
+ * Goods physically leave the warehouse at Shipped: convert the standing
+ * reservation into an actual stock deduction (qty_on_hand -= qty, qty_reserved
+ * -= qty) and record a stock movement per line for the audit trail.
+ */
+function dos_ship_order_inventory(string $tid, string $uid, string $warehouseId, string $orderId): void {
+    $items = Db::all("SELECT soi.product_id,soi.qty_ordered,p.cost_price FROM sales_order_items soi JOIN products p ON p.id=soi.product_id WHERE soi.order_id=? AND soi.tenant_id=?", [$orderId, $tid]);
+    foreach ($items as $it) {
+        $qty = (float) $it['qty_ordered'];
+        $inv = Db::one("SELECT qty_on_hand FROM inventory WHERE product_id=? AND warehouse_id=? AND tenant_id=?", [$it['product_id'], $warehouseId, $tid]);
+        $before = (float) ($inv['qty_on_hand'] ?? 0);
+        $after  = max(0, $before - $qty);
+        Db::run("UPDATE inventory SET qty_on_hand=?,qty_reserved=GREATEST(0,qty_reserved-?) WHERE product_id=? AND warehouse_id=? AND tenant_id=?",
+            [$after, $qty, $it['product_id'], $warehouseId, $tid]);
+        Db::run("INSERT INTO stock_movements(tenant_id,product_id,warehouse_id,type,reference_type,reference_id,qty,unit_cost,qty_before,qty_after,reason,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            [$tid, $it['product_id'], $warehouseId, 'OUT', 'sales_order', $orderId, $qty, $it['cost_price'], $before, $after, 'Order Shipped', $uid]);
     }
 }
 
@@ -716,8 +766,25 @@ function route_invoices(string $m, $id, array $b, array $q, $tid, $uid, $nextNum
         [$rows,$pg]=Db::paged("SELECT i.*,c.name customer_name FROM invoices i JOIN customers c ON c.id=i.customer_id $w ORDER BY i.invoice_date DESC",$p,(int)($q['page']??1));
         Http::paged($rows,$pg);
     }
-    if ($m==='POST') { Auth::need('invoices','create'); $id2=Db::uuid(); $inum='INV-'.date('Y').'-'.str_pad((int)Db::val("SELECT COUNT(*) FROM invoices WHERE tenant_id=?",[$t])+1,4,'0',STR_PAD_LEFT); Db::run("INSERT INTO invoices(id,tenant_id,invoice_number,order_id,customer_id,status,invoice_date,due_date,total_amount,currency,notes,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",[$id2,$t,$inum,$b['order_id']??null,$b['customer_id']??'',$b['status']??'Draft',$b['invoice_date']??date('Y-m-d'),$b['due_date']??null,(float)($b['total_amount']??0),$b['currency']??'USD',$b['notes']??null,$uid()]); Http::created(Db::one("SELECT * FROM invoices WHERE id=? AND tenant_id=?",[$id2,$t])); }
-    if ($m==='PUT') { Auth::need('invoices','update'); Db::run("UPDATE invoices SET status=?,due_date=?,notes=? WHERE id=? AND tenant_id=?",[$b['status']??'Draft',$b['due_date']??null,$b['notes']??null,$id,$t]); Http::ok(Db::one("SELECT * FROM invoices WHERE id=? AND tenant_id=?",[$id,$t])); }
+    if ($m==='POST') {
+        Auth::need('invoices','create');
+        Validator::check($b,['customer_id'=>'required','total_amount'=>'required|numeric|min_val:0']);
+        $cust=Db::one("SELECT id FROM customers WHERE id=? AND tenant_id=? AND deleted_at IS NULL",[$b['customer_id'],$t]);
+        if (!$cust) throw new NotFound('Customer not found');
+        $id2=Db::uuid(); $inum='INV-'.date('Y').'-'.str_pad((int)Db::val("SELECT COUNT(*) FROM invoices WHERE tenant_id=?",[$t])+1,4,'0',STR_PAD_LEFT);
+        Db::run("INSERT INTO invoices(id,tenant_id,invoice_number,order_id,customer_id,status,invoice_date,due_date,total_amount,currency,notes,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            [$id2,$t,$inum,$b['order_id']??null,$b['customer_id'],$b['status']??'Draft',$b['invoice_date']??date('Y-m-d'),$b['due_date']??null,(float)$b['total_amount'],$b['currency']??'USD',$b['notes']??null,$uid()]);
+        Audit::log('CREATE','invoice',$id2,$inum,null,['total'=>$b['total_amount']]);
+        Http::created(Db::one("SELECT * FROM invoices WHERE id=? AND tenant_id=?",[$id2,$t]));
+    }
+    if ($m==='PUT') {
+        Auth::need('invoices','update');
+        $row=Db::one("SELECT * FROM invoices WHERE id=? AND tenant_id=?",[$id,$t]);
+        if (!$row) throw new NotFound('Invoice not found');
+        Db::run("UPDATE invoices SET status=?,due_date=?,notes=? WHERE id=? AND tenant_id=?",[$b['status']??'Draft',$b['due_date']??null,$b['notes']??null,$id,$t]);
+        Audit::log('UPDATE','invoice',$id,$row['invoice_number'],$row,Audit::diff($row,$b));
+        Http::ok(Db::one("SELECT * FROM invoices WHERE id=? AND tenant_id=?",[$id,$t]));
+    }
     throw new Err('Method not allowed',405);
 }
 
@@ -729,12 +796,23 @@ function route_payments(string $m, $id, array $b, array $q, $tid, $uid): never {
         Auth::need('payments','create');
         Validator::check($b,['amount'=>'required|numeric|min_val:0.01','payment_date'=>'required|date','method'=>'required']);
         $id2=Db::uuid();
-        Db::run("INSERT INTO payments(id,tenant_id,invoice_id,customer_id,amount,currency,method,reference,payment_date,notes,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-            [$id2,$t,$b['invoice_id']??null,$b['customer_id']??null,(float)$b['amount'],$b['currency']??'USD',$b['method'],$b['reference']??null,$b['payment_date'],$b['notes']??null,$uid()]);
-        if (!empty($b['invoice_id'])) {
-            $inv=Db::one("SELECT * FROM invoices WHERE id=? AND tenant_id=?",[$b['invoice_id'],$t]);
-            if ($inv) { $np=(float)$inv['paid_amount']+(float)$b['amount']; $ns=$np>=(float)$inv['total_amount']?'Paid':($np>0?'Partially Paid':$inv['status']); Db::run("UPDATE invoices SET paid_amount=?,status=? WHERE id=? AND tenant_id=?",[$np,$ns,$b['invoice_id'],$t]); Db::run("UPDATE customers SET outstanding_balance=outstanding_balance-? WHERE id=? AND tenant_id=?",[(float)$b['amount'],$inv['customer_id'],$t]); }
-        }
+        Db::begin();
+        try {
+            Db::run("INSERT INTO payments(id,tenant_id,invoice_id,customer_id,amount,currency,method,reference,payment_date,notes,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                [$id2,$t,$b['invoice_id']??null,$b['customer_id']??null,(float)$b['amount'],$b['currency']??'USD',$b['method'],$b['reference']??null,$b['payment_date'],$b['notes']??null,$uid()]);
+            if (!empty($b['invoice_id'])) {
+                // Lock the invoice row for this transaction so two concurrent payments
+                // against the same invoice can't both read the same paid_amount and race.
+                $inv=Db::one("SELECT * FROM invoices WHERE id=? AND tenant_id=? FOR UPDATE",[$b['invoice_id'],$t]);
+                if ($inv) {
+                    $np=(float)$inv['paid_amount']+(float)$b['amount'];
+                    $ns=$np>=(float)$inv['total_amount']?'Paid':($np>0?'Partially Paid':$inv['status']);
+                    Db::run("UPDATE invoices SET paid_amount=?,status=? WHERE id=? AND tenant_id=?",[$np,$ns,$b['invoice_id'],$t]);
+                    Db::run("UPDATE customers SET outstanding_balance=outstanding_balance-? WHERE id=? AND tenant_id=?",[(float)$b['amount'],$inv['customer_id'],$t]);
+                }
+            }
+            Db::commit();
+        } catch (Throwable $e) { Db::rollback(); throw $e; }
         Audit::log('CREATE','payment',$id2,'$'.$b['amount']);
         Http::created(Db::one("SELECT * FROM payments WHERE id=? AND tenant_id=?",[$id2,$t]));
     }
