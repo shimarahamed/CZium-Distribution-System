@@ -33,6 +33,11 @@ const Api = {
   put:    (p, b) => Api.req('PUT',    p, b),
   patch:  (p, b) => Api.req('PATCH',  p, b),
   delete: (p)    => Api.req('DELETE', p),
+
+  // Direct URL for links/iframes that the browser fetches itself (e.g. PDF
+  // preview/download) — auth rides on the dos_token cookie the backend sets
+  // at login, not the Bearer header, since <iframe>/<a> can't attach one.
+  url: (p) => `${BASE}/${p.replace(/^\/+/, '')}`,
 };
 
 export default Api;

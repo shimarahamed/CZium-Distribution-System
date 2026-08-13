@@ -1187,6 +1187,7 @@ function route_production(string $m, $id, $sub, array $b, array $q, $tid, $uid):
             }
             // Add finished goods to inventory
             $warehouseId = $batch['warehouse_id'] ?? Db::val("SELECT id FROM warehouses WHERE tenant_id=? LIMIT 1", [$t]);
+            if (!$warehouseId) throw new Unproc('No warehouse available — create a warehouse before completing production batches.');
             $existing = Db::val("SELECT id FROM inventory WHERE product_id=? AND warehouse_id=? AND tenant_id=?",
                 [$batch['product_id'], $warehouseId, $t]);
             if ($existing) {

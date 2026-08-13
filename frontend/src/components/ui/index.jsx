@@ -1,5 +1,6 @@
 // src/components/ui/index.jsx
 // Shared UI components — Tailwind CSS, shadcn/ui design tokens
+import { useState, useMemo } from "react";
 
 // ─── Button ───────────────────────────────────────────────
 export function Button({ children, variant = 'primary', size = 'md', className = '', disabled, onClick, type = 'button', ...props }) {
@@ -164,7 +165,35 @@ export function Modal({ open, onClose, title, children, footer, size = 'md' }) {
 }
 
 // ─── Table ────────────────────────────────────────────────
+// Columns with `sortable: true` get a clickable header that toggles asc/desc
+// client-side sort on that column's raw value. Columns without it behave
+// exactly as before — this is purely additive.
 export function Table({ columns, data, onRowClick, emptyText = 'No data', loading = false }) {
+  const [sort, setSort] = useState(null); // { key, dir: 'asc'|'desc' }
+
+  const sortedData = useMemo(() => {
+    if (!sort || !data?.length) return data;
+    const { key, dir } = sort;
+    const copy = [...data];
+    copy.sort((a, b) => {
+      const av = a[key], bv = b[key];
+      if (av == null && bv == null) return 0;
+      if (av == null) return 1;
+      if (bv == null) return -1;
+      const an = typeof av === 'number' ? av : parseFloat(av);
+      const bn = typeof bv === 'number' ? bv : parseFloat(bv);
+      const bothNumeric = !isNaN(an) && !isNaN(bn) && av !== '' && bv !== '';
+      const cmp = bothNumeric ? an - bn : String(av).localeCompare(String(bv), undefined, { numeric: true, sensitivity: 'base' });
+      return dir === 'asc' ? cmp : -cmp;
+    });
+    return copy;
+  }, [data, sort]);
+
+  const toggleSort = (col) => {
+    if (!col.sortable) return;
+    setSort(prev => prev?.key === col.key ? { key: col.key, dir: prev.dir === 'asc' ? 'desc' : 'asc' } : { key: col.key, dir: 'asc' });
+  };
+
   if (loading) return (
     <div className="flex items-center justify-center py-16 text-muted-foreground text-sm gap-2">
       <Spinner size="sm" /> Loading...
@@ -176,16 +205,18 @@ export function Table({ columns, data, onRowClick, emptyText = 'No data', loadin
         <thead>
           <tr className="border-b border-border bg-muted/50">
             {columns.map(col => (
-              <th key={col.key} className={`px-4 py-2.5 text-left text-xs font-semibold text-muted-foreground uppercase tracking-wide whitespace-nowrap ${col.className || ''}`}>
+              <th key={col.key} onClick={() => toggleSort(col)}
+                className={`px-4 py-2.5 text-left text-xs font-semibold text-muted-foreground uppercase tracking-wide whitespace-nowrap ${col.sortable ? 'cursor-pointer select-none hover:text-foreground' : ''} ${col.className || ''}`}>
                 {col.header}
+                {col.sortable && <span className="inline-block ml-1 opacity-60">{sort?.key === col.key ? (sort.dir === 'asc' ? '▲' : '▼') : '↕'}</span>}
               </th>
             ))}
           </tr>
         </thead>
         <tbody>
-          {!data?.length ? (
+          {!sortedData?.length ? (
             <tr><td colSpan={columns.length} className="px-4 py-12 text-center text-muted-foreground text-sm">{emptyText}</td></tr>
-          ) : data.map((row, i) => (
+          ) : sortedData.map((row, i) => (
             <tr key={i}
               onClick={() => onRowClick?.(row)}
               className={`border-b border-border hover:bg-muted/30 transition-colors ${onRowClick ? 'cursor-pointer' : ''}`}>

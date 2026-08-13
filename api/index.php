@@ -386,11 +386,12 @@ function route_inventory(string $m, $id, array $b, array $q, $tid, $uid): never 
     $t=$tid();
     if ($m==='GET') {
         Auth::need('inventory','read');
-        $s=$q['search']??''; $al=$q['alert']??'';
+        $s=$q['search']??''; $al=$q['alert']??''; $wh=$q['warehouse_id']??'';
         $p=[$t]; $w="WHERE p.tenant_id=? AND p.deleted_at IS NULL";
         if ($s){$w.=" AND(p.name LIKE ? OR p.sku LIKE ?)";$p=array_merge($p,["%$s%","%$s%"]);}
-        if ($al==='low')  $w.=" AND i.qty_on_hand<=p.reorder_point";
-        if ($al==='zero') $w.=" AND i.qty_on_hand=0";
+        if ($al==='low')  $w.=" AND COALESCE(i.qty_on_hand,0)<=p.reorder_point";
+        if ($al==='zero') $w.=" AND COALESCE(i.qty_on_hand,0)=0";
+        if ($wh){$w.=" AND i.warehouse_id=?";$p[]=$wh;}
         [$rows,$pg]=Db::paged("SELECT p.id,p.sku,p.name,p.brand,p.unit_of_measure,p.reorder_point,p.cost_price,p.sale_price,p.status,i.warehouse_id,i.qty_on_hand,i.qty_reserved,i.qty_available,i.avg_cost,w.name warehouse_name,cat.name category_name FROM products p LEFT JOIN inventory i ON i.product_id=p.id LEFT JOIN warehouses w ON w.id=i.warehouse_id LEFT JOIN categories cat ON cat.id=p.category_id $w ORDER BY p.name",$p,(int)($q['page']??1));
         Http::paged($rows,$pg);
     }
@@ -405,7 +406,10 @@ function route_inventory(string $m, $id, array $b, array $q, $tid, $uid): never 
             $before=(float)($inv['qty_on_hand']??0);
             $after=Calc::applyMovement($before,(float)$b['qty'],$b['type']);
             if (in_array($b['type'],['OUT','DAMAGED'])&&($before-abs((float)$b['qty']))<0) throw new Unproc("Insufficient stock. Available: $before");
-            Db::run("INSERT INTO inventory(id,tenant_id,product_id,warehouse_id,qty_on_hand,avg_cost) VALUES(?,?,?,?,?,?) ON DUPLICATE KEY UPDATE qty_on_hand=?",[Db::uuid(),$t,$b['product_id'],$b['warehouse_id'],$after,$prod['cost_price'],$after]);
+            $reserved=(float)($inv['qty_reserved']??0);
+            $afterAvail=max(0,$after-$reserved);
+            Db::run("INSERT INTO inventory(id,tenant_id,product_id,warehouse_id,qty_on_hand,qty_available,avg_cost) VALUES(?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE qty_on_hand=?,qty_available=?",
+                [Db::uuid(),$t,$b['product_id'],$b['warehouse_id'],$after,$afterAvail,$prod['cost_price'],$after,$afterAvail]);
             Db::run("INSERT INTO stock_movements(tenant_id,product_id,warehouse_id,type,batch_number,lot_number,expiry_date,qty,unit_cost,qty_before,qty_after,reason,notes,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 [$t,$b['product_id'],$b['warehouse_id'],$b['type'],$b['batch_number']??null,$b['lot_number']??null,$b['expiry_date']??null,abs((float)$b['qty']),$prod['cost_price'],$before,$after,$b['reason'],$b['notes']??null,$uid()]);
             if ($after<=$prod['reorder_point']) Workflow::run('inventory','stock_below_reorder',['product_name'=>$prod['name'],'qty_on_hand'=>$after,'reorder_point'=>$prod['reorder_point']]);
@@ -477,6 +481,13 @@ function route_orders(string $m, $id, $sub, array $b, array $q, $tid, $uid, $fin
             if ($o['customer_email']) Mailer::send($o['customer_email'],"Invoice $inum from ".APP_NAME,"Dear {$o['customer_name']},\n\nPlease find your invoice $inum for order {$o['order_number']}.\n\nAmount Due: {$o['total_amount']} {$o['currency']}\nDue Date: $due\n\nThank you for your business.");
             Http::created(Db::one("SELECT * FROM invoices WHERE id=? AND tenant_id=?",[$invId,$t]));
         }
+        // GET /orders/{id}/invoice — look up the invoice already raised for this order, if any
+        if ($sub==='invoice' && $m==='GET') {
+            Auth::need('invoices','read');
+            $inv=Db::one("SELECT * FROM invoices WHERE order_id=? AND tenant_id=? AND status NOT IN('Cancelled') ORDER BY created_at DESC LIMIT 1",[$id,$t]);
+            if (!$inv) throw new NotFound('No invoice has been created for this order yet.');
+            Http::ok($inv);
+        }
         // GET /orders/{id}/items
         if ($sub==='items' && $m==='GET') {
             Auth::need('orders','read');
@@ -488,20 +499,21 @@ function route_orders(string $m, $id, $sub, array $b, array $q, $tid, $uid, $fin
         case 'GET':
             Auth::need('orders','read');
             if ($id) {
-                $o=Db::one("SELECT so.*,c.name customer_name,c.credit_limit,c.outstanding_balance,w.name warehouse_name FROM sales_orders so JOIN customers c ON c.id=so.customer_id LEFT JOIN warehouses w ON w.id=so.warehouse_id WHERE so.id=? AND so.tenant_id=? AND so.deleted_at IS NULL",[$id,$t]);
+                $o=Db::one("SELECT so.*,c.name customer_name,c.credit_limit,c.outstanding_balance,w.name warehouse_name,r.name rep_name FROM sales_orders so JOIN customers c ON c.id=so.customer_id LEFT JOIN warehouses w ON w.id=so.warehouse_id LEFT JOIN sales_reps r ON r.id=so.rep_id WHERE so.id=? AND so.tenant_id=? AND so.deleted_at IS NULL",[$id,$t]);
                 if (!$o) throw new NotFound('Order not found');
                 $items=Db::all("SELECT soi.*,p.name product_name,p.sku,p.unit_of_measure FROM sales_order_items soi JOIN products p ON p.id=soi.product_id WHERE soi.order_id=? AND soi.tenant_id=? ORDER BY soi.sort_order",[$id,$t]);
                 Audit::log('VIEW','sales_order',$id,$o['order_number']);
                 Http::ok(['order'=>$o,'items'=>$items]);
             }
-            $s=$q['search']??''; $st=$q['status']??'';
+            $s=$q['search']??''; $st=$q['status']??''; $rp=$q['rep_id']??'';
             $p=[$t]; $w="WHERE so.tenant_id=? AND so.deleted_at IS NULL";
             if ($s){$w.=" AND(so.order_number LIKE ? OR c.name LIKE ?)";$p=array_merge($p,["%$s%","%$s%"]);}
             if ($st){$w.=" AND so.status=?";$p[]=$st;}
+            if ($rp){$w.=" AND so.rep_id=?";$p[]=$rp;}
             // Row-level scoping: a field rep only ever sees their own orders.
             [$scSql,$scP] = Scope::orders('so');
             if ($scSql) { $w .= $scSql; $p = array_merge($p, $scP); }
-            [$rows,$pg]=Db::paged("SELECT so.*,c.name customer_name FROM sales_orders so JOIN customers c ON c.id=so.customer_id $w ORDER BY so.order_date DESC,so.created_at DESC",$p,(int)($q['page']??1));
+            [$rows,$pg]=Db::paged("SELECT so.*,c.name customer_name,r.name rep_name FROM sales_orders so JOIN customers c ON c.id=so.customer_id LEFT JOIN sales_reps r ON r.id=so.rep_id $w ORDER BY so.order_date DESC,so.created_at DESC",$p,(int)($q['page']??1));
             Http::paged($rows,$pg);
         case 'POST':
             Auth::need('orders','create');
@@ -510,6 +522,9 @@ function route_orders(string $m, $id, $sub, array $b, array $q, $tid, $uid, $fin
             $cust=Db::one("SELECT * FROM customers WHERE id=? AND tenant_id=? AND deleted_at IS NULL",[$b['customer_id'],$t]);
             if (!$cust) throw new NotFound('Customer not found');
             if ($cust['status']==='On Hold') throw new Unproc('Customer is on credit hold. Orders cannot be placed.');
+            // A field rep's own orders are always attributed to them; a back-office user
+            // creating on a rep's behalf may pass rep_id explicitly in the body.
+            $b = Scope::stampRep($b);
             Db::begin();
             try {
                 $oid=Db::uuid(); $onum=$nextNum('sales_orders','SO');
@@ -528,8 +543,8 @@ function route_orders(string $m, $id, $sub, array $b, array $q, $tid, $uid, $fin
                 $total=round($sub2+$tax+(float)($b['shipping_amount']??0),2);
                 if (Calc::exceedsCredit($cust['credit_limit'],$cust['outstanding_balance'],$total))
                     throw new Unproc(sprintf('Order exceeds credit limit ($%.2f). Balance: $%.2f, Order: $%.2f',$cust['credit_limit'],$cust['outstanding_balance'],$total));
-                Db::run("INSERT INTO sales_orders(id,tenant_id,order_number,customer_id,warehouse_id,status,payment_status,priority,order_date,delivery_date,subtotal,discount_amount,tax_amount,shipping_amount,total_amount,currency,notes,internal_notes,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    [$oid,$t,$onum,$b['customer_id'],$b['warehouse_id']??null,$b['status']??'Draft','Unpaid',$b['priority']??'Normal',$b['order_date'],$b['delivery_date']??null,$sub2,$disc,$tax,(float)($b['shipping_amount']??0),$total,$b['currency']??'USD',$b['notes']??null,$b['internal_notes']??null,$uid()]);
+                Db::run("INSERT INTO sales_orders(id,tenant_id,order_number,customer_id,warehouse_id,rep_id,status,payment_status,priority,order_date,delivery_date,subtotal,discount_amount,tax_amount,shipping_amount,total_amount,currency,notes,internal_notes,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    [$oid,$t,$onum,$b['customer_id'],$b['warehouse_id']??null,$b['rep_id']??null,$b['status']??'Draft','Unpaid',$b['priority']??'Normal',$b['order_date'],$b['delivery_date']??null,$sub2,$disc,$tax,(float)($b['shipping_amount']??0),$total,$b['currency']??'USD',$b['notes']??null,$b['internal_notes']??null,$uid()]);
                 foreach ($idata as $it)
                     Db::run("INSERT INTO sales_order_items(id,tenant_id,order_id,product_id,qty_ordered,unit_price,discount_pct,discount_amount,tax_pct,tax_amount,line_total,sort_order,notes) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         [$it['id'],$t,$oid,$it['pid'],$it['qty'],$it['price'],$it['dp'],$it['da'],$it['tp'],$it['ta'],$it['lt'],$it['sort'],$it['notes']]);
@@ -663,10 +678,11 @@ function route_po(string $m, $id, $sub, array $b, array $q, $tid, $uid, $findOrF
                 $items=Db::all("SELECT poi.*,p.name product_name,p.sku,p.unit_of_measure FROM purchase_order_items poi JOIN products p ON p.id=poi.product_id WHERE poi.po_id=? AND poi.tenant_id=? ORDER BY poi.sort_order",[$id,$t]);
                 Http::ok(['po'=>$po,'items'=>$items]);
             }
-            $s=$q['search']??''; $st=$q['status']??'';
+            $s=$q['search']??''; $st=$q['status']??''; $sup=$q['supplier_id']??'';
             $p=[$t]; $w="WHERE po.tenant_id=? AND po.deleted_at IS NULL";
             if ($s){$w.=" AND(po.po_number LIKE ? OR su.name LIKE ?)";$p=array_merge($p,["%$s%","%$s%"]);}
             if ($st){$w.=" AND po.status=?";$p[]=$st;}
+            if ($sup){$w.=" AND po.supplier_id=?";$p[]=$sup;}
             [$rows,$pg]=Db::paged("SELECT po.*,su.name supplier_name FROM purchase_orders po JOIN suppliers su ON su.id=po.supplier_id $w ORDER BY po.order_date DESC",$p,(int)($q['page']??1));
             Http::paged($rows,$pg);
         case 'POST':
@@ -723,8 +739,9 @@ function route_suppliers(string $m, $id, array $b, array $q, $tid, $uid, $findOr
         case 'GET':
             Auth::need('suppliers','read');
             if ($id) Http::ok($findOrFail('suppliers',$id));
-            $s=$q['search']??''; $p=[$t]; $w="WHERE tenant_id=? AND deleted_at IS NULL";
+            $s=$q['search']??''; $st=$q['status']??''; $p=[$t]; $w="WHERE tenant_id=? AND deleted_at IS NULL";
             if ($s){$w.=" AND(name LIKE ? OR code LIKE ?)";$p=array_merge($p,["%$s%","%$s%"]);}
+            if ($st){$w.=" AND status=?";$p[]=$st;}
             [$rows,$pg]=Db::paged("SELECT * FROM suppliers $w ORDER BY name",$p,(int)($q['page']??1));
             Http::paged($rows,$pg);
         case 'POST':
@@ -758,6 +775,7 @@ function route_invoices(string $m, $id, array $b, array $q, $tid, $uid, $nextNum
     if ($m==='GET') {
         if ($id) { $r=Db::one("SELECT i.*,c.name customer_name FROM invoices i JOIN customers c ON c.id=i.customer_id WHERE i.id=? AND i.tenant_id=?",[$id,$t]); if(!$r) throw new NotFound(); Http::ok($r); }
         $p=[$t]; $w="WHERE i.tenant_id=?";
+        if (!empty($q['search'])){$w.=" AND(i.invoice_number LIKE ? OR c.name LIKE ?)";$p[]="%{$q['search']}%";$p[]="%{$q['search']}%";}
         if (!empty($q['status'])){$w.=" AND i.status=?";$p[]=$q['status'];}
         if (!empty($q['customer_id'])){$w.=" AND i.customer_id=?";$p[]=$q['customer_id'];}
         // Row-level scoping: a field rep only sees invoices they raised.
@@ -901,6 +919,37 @@ function route_users(string $m, $id, array $b, $tid, $uid): never {
 function route_roles(string $m, $id, array $b, $tid, $uid): never {
     $t=$tid(); Auth::need('settings','read');
     if ($m==='GET') Http::ok(Db::all("SELECT id,name,permissions,is_system FROM roles WHERE tenant_id=? ORDER BY name",[$t]));
+    if ($m==='POST') {
+        Auth::need('settings','update');
+        Validator::check($b,['name'=>'required|max:100']);
+        if (Db::one("SELECT id FROM roles WHERE tenant_id=? AND name=?",[$t,$b['name']])) throw new Conflict('A role with this name already exists.');
+        $id2=Db::uuid();
+        Db::run("INSERT INTO roles(id,tenant_id,name,permissions,is_system) VALUES(?,?,?,?,0)",
+            [$id2,$t,$b['name'],json_encode($b['permissions']??[])]);
+        Audit::log('CREATE','role',$id2,$b['name']);
+        Http::created(Db::one("SELECT id,name,permissions,is_system FROM roles WHERE id=? AND tenant_id=?",[$id2,$t]));
+    }
+    if ($m==='PUT') {
+        Auth::need('settings','update');
+        $row=Db::one("SELECT * FROM roles WHERE id=? AND tenant_id=?",[$id,$t]);
+        if (!$row) throw new NotFound('Role not found');
+        if (!empty($row['is_system'])) throw new Unproc('System roles cannot be edited.');
+        Validator::check($b,['name'=>'required|max:100']);
+        Db::run("UPDATE roles SET name=?,permissions=? WHERE id=? AND tenant_id=?",
+            [$b['name'],json_encode($b['permissions']??json_decode($row['permissions'],true)??[]),$id,$t]);
+        Audit::log('UPDATE','role',$id,$b['name'],$row,['permissions'=>$b['permissions']??null]);
+        Http::ok(Db::one("SELECT id,name,permissions,is_system FROM roles WHERE id=? AND tenant_id=?",[$id,$t]));
+    }
+    if ($m==='DELETE') {
+        Auth::need('settings','update');
+        $row=Db::one("SELECT * FROM roles WHERE id=? AND tenant_id=?",[$id,$t]);
+        if (!$row) throw new NotFound('Role not found');
+        if (!empty($row['is_system'])) throw new Unproc('System roles cannot be deleted.');
+        if (Db::val("SELECT COUNT(*) FROM users WHERE role_id=? AND tenant_id=? AND deleted_at IS NULL",[$id,$t])) throw new Conflict('Role is assigned to one or more users.');
+        Db::run("DELETE FROM roles WHERE id=? AND tenant_id=?",[$id,$t]);
+        Audit::log('DELETE','role',$id,$row['name'],$row);
+        Http::noContent();
+    }
     throw new Err('Method not allowed',405);
 }
 
